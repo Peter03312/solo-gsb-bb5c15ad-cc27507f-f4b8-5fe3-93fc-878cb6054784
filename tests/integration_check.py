@@ -1042,6 +1042,368 @@ def main() -> int:
         check("当前版组集合不一致被拒绝(422)", r.status_code == 422
               and r.json()["detail"]["error"] == "group_set_mismatch", r.text)
 
+        # ---------------------------------------------------------------- #
+        # 设备组可调谐支持集合：录入/读取/按组变更（修订号）/发布/锁定/无解
+        # ---------------------------------------------------------------- #
+        r = c.post("/sessions", json={"name": "组能力演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6]})
+        kid = r.json()["id"]
+        check("创建组能力场次", r.status_code == 201, r.text)
+        # 录入时不填支持频点 -> 视为支持场次全部频点，修订号 1
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "音响", "start": 0, "end": 120})
+        k1 = r.json()["id"]
+        check("未填支持集合继承全场次频点",
+              r.status_code == 201
+              and r.json()["supported_frequencies"] == [1, 2, 3, 4, 5, 6]
+              and r.json()["support_inherited"] is True
+              and r.json()["config_revision"] == 1, r.text)
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "灯光", "start": 60, "end": 180})
+        k2 = r.json()["id"]
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "返送", "start": 120, "end": 240})
+        k3 = r.json()["id"]
+        # 录入时直接限定支持频点（非空子集）
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "窄带设备", "start": 0, "end": 60,
+                         "supported_frequencies": [2, 2, 4]})
+        k4 = r.json()["id"]
+        check("录入时限定支持频点(去重)",
+              r.status_code == 201
+              and r.json()["supported_frequencies"] == [2, 4]
+              and r.json()["support_inherited"] is False
+              and r.json()["config_revision"] == 1, r.text)
+        # 空集合 / 非子集 -> 400
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "坏支持", "start": 0, "end": 60,
+                         "supported_frequencies": []})
+        check("空支持集合被拒绝(400)", r.status_code == 400, r.text)
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "越界支持", "start": 0, "end": 60,
+                         "supported_frequencies": [1, 99]})
+        check("非场次频点的支持集合被拒绝(400)", r.status_code == 400, r.text)
+
+        # 读取组信息：支持集合 + 配置修订号
+        r = c.get(f"/sessions/{kid}/groups/{k4}")
+        check("GET 单组返回支持集合与修订号",
+              r.status_code == 200
+              and r.json()["supported_frequencies"] == [2, 4]
+              and r.json()["config_revision"] == 1, r.text)
+        r = c.get(f"/sessions/{kid}/groups/999999")
+        check("GET 未知组(404)", r.status_code == 404, r.text)
+        r = c.get(f"/sessions/{kid}")
+        gmap = {g["id"]: g for g in r.json()["groups"]}
+        check("场次详情含每组支持集合与修订号",
+              gmap[k1]["supported_frequencies"] == [1, 2, 3, 4, 5, 6]
+              and gmap[k1]["config_revision"] == 1
+              and gmap[k4]["supported_frequencies"] == [2, 4], r.text)
+
+        # 干扰关系：k1-k2、k2-k3 间距 3
+        c.post(f"/sessions/{kid}/interferences",
+               json={"group_a": k1, "group_b": k2, "min_separation": 3})
+        c.post(f"/sessions/{kid}/interferences",
+               json={"group_a": k2, "group_b": k3, "min_separation": 3})
+
+        # 按组变更支持集合：携带所见修订号
+        r = c.put(f"/sessions/{kid}/groups/support",
+                  json={"groups": [
+                      {"group_id": k2, "config_revision": 1,
+                       "supported_frequencies": [1, 2, 3]}]})
+        check("变更支持集合成功(200)，修订号+1",
+              r.status_code == 200
+              and r.json()["updated"][0]["config_revision"] == 2
+              and r.json()["updated"][0]["supported_frequencies"] == [1, 2, 3]
+              and r.json()["updated"][0]["support_inherited"] is False, r.text)
+        # 过期修订号 -> 409，整次拒绝、不覆盖
+        r = c.put(f"/sessions/{kid}/groups/support",
+                  json={"groups": [
+                      {"group_id": k2, "config_revision": 1,
+                       "supported_frequencies": [1, 2]}]})
+        check("过期修订号拒绝(409)且给出新旧修订号",
+              r.status_code == 409
+              and r.json()["detail"]["error"] == "revision_conflict"
+              and r.json()["detail"]["stale_groups"] == [{
+                  "group_id": k2, "seen_revision": 1,
+                  "current_revision": 2}], r.text)
+        r = c.get(f"/sessions/{kid}/groups/{k2}")
+        check("过期提交未覆盖新配置",
+              r.json()["supported_frequencies"] == [1, 2, 3]
+              and r.json()["config_revision"] == 2, r.text)
+        # 非子集 / 未知组 / 同组重复 / 空集合 -> 400，整次拒绝
+        r = c.put(f"/sessions/{kid}/groups/support",
+                  json={"groups": [
+                      {"group_id": k2, "config_revision": 2,
+                       "supported_frequencies": [3, 99]}]})
+        check("支持集合非子集被拒绝(400)", r.status_code == 400, r.text)
+        r = c.put(f"/sessions/{kid}/groups/support",
+                  json={"groups": [
+                      {"group_id": k2, "config_revision": 2,
+                       "supported_frequencies": []}]})
+        check("空支持集合被拒绝(400)", r.status_code == 400
+              and r.json()["detail"]["error"] == "invalid_support", r.text)
+        r = c.put(f"/sessions/{kid}/groups/support",
+                  json={"groups": [
+                      {"group_id": 999999, "config_revision": 1,
+                       "supported_frequencies": [1]}]})
+        check("变更引用未知组被拒绝(400)", r.status_code == 400, r.text)
+        r = c.put(f"/sessions/{kid}/groups/support",
+                  json={"groups": [
+                      {"group_id": k2, "config_revision": 2,
+                       "supported_frequencies": [2]},
+                      {"group_id": k2, "config_revision": 2,
+                       "supported_frequencies": [3]}]})
+        check("同组重复变更被拒绝(400)", r.status_code == 400, r.text)
+        r = c.get(f"/sessions/{kid}/groups/{k2}")
+        check("非法提交均未改变配置",
+              r.json()["supported_frequencies"] == [1, 2, 3]
+              and r.json()["config_revision"] == 2, r.text)
+
+        # 发布遵守当前支持集合：k2 ∈ {1,2,3}，(1,4,1) 不可得 -> (4,1,4)；
+        # k4 无干扰、支持 {2,4}，字典序最小取 2
+        r = c.post(f"/sessions/{kid}/plans",
+                   json={"base_version": 0, "locks": []})
+        check("按支持集合规划发布 v1",
+              r.status_code == 201
+              and {x["group_id"]: x["frequency"]
+                   for x in r.json()["assignments"]}
+              == {k1: 4, k2: 1, k3: 4, k4: 2}, r.text)
+        # 锁定到组不支持的频点 -> 400（区别于 422，整次拒绝）
+        r = c.post(f"/sessions/{kid}/plans",
+                   json={"base_version": 1,
+                         "locks": [{"group_id": k2, "frequency": 4}]})
+        check("锁定组不支持的频点被拒绝(400)", r.status_code == 400, r.text)
+        # 历史发布版保持原样，不随能力变化重写
+        r = c.get(f"/sessions/{kid}/plans/1")
+        check("旧发布版保持原样",
+              {x["group_id"]: x["frequency"]
+               for x in r.json()["assignments"]}
+              == {k1: 4, k2: 1, k3: 4, k4: 2}, r.text)
+
+        # 能力约束本身无解：两组全程重叠间距 3，各自只支持 {1}/{2}
+        r = c.post("/sessions", json={"name": "能力无解演示",
+                                      "frequencies": [1, 2, 3, 4, 5]})
+        qid = r.json()["id"]
+        r = c.post(f"/sessions/{qid}/groups",
+                   json={"name": "p", "start": 0, "end": 100,
+                         "supported_frequencies": [1]})
+        q1 = r.json()["id"]
+        r = c.post(f"/sessions/{qid}/groups",
+                   json={"name": "q", "start": 0, "end": 100,
+                         "supported_frequencies": [2]})
+        q2 = r.json()["id"]
+        c.post(f"/sessions/{qid}/interferences",
+               json={"group_a": q1, "group_b": q2, "min_separation": 3})
+        r = c.post(f"/sessions/{qid}/plans",
+                   json={"base_version": 0, "locks": []})
+        check("能力导致规划无解(422)并报告涉及组",
+              r.status_code == 422
+              and {g["group_id"] for g in
+                   r.json()["detail"]["unsupported_groups"]} == {q1, q2},
+              r.text)
+        check("无解时占用与发布版均不变（无任何版本）",
+              [p["version"] for p in c.get(
+                  f"/sessions/{qid}/plans").json()] == []
+              and c.get(f"/sessions/{qid}/occupations").json() == [], r.text)
+
+        # ---------------------------------------------------------------- #
+        # 能力变化使占用调整快照失效；预演/确认遵守支持集合
+        # ---------------------------------------------------------------- #
+        # 干净新场次：x、y 时段相交，间距 3；v1=(1,4)
+        r = c.post("/sessions", json={"name": "能力调整演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6, 7]})
+        eid = r.json()["id"]
+        r = c.post(f"/sessions/{eid}/groups",
+                   json={"name": "x", "start": 0, "end": 120})
+        e1 = r.json()["id"]
+        r = c.post(f"/sessions/{eid}/groups",
+                   json={"name": "y", "start": 60, "end": 180})
+        e2 = r.json()["id"]
+        c.post(f"/sessions/{eid}/interferences",
+               json={"group_a": e1, "group_b": e2, "min_separation": 3})
+        r = c.post(f"/sessions/{eid}/plans",
+                   json={"base_version": 0, "locks": []})
+        check("能力调整场次发布 v1=(1,4)",
+              {x["group_id"]: x["frequency"]
+               for x in r.json()["assignments"]} == {e1: 1, e2: 4}, r.text)
+        # 先取得一个空变更快照
+        r = c.post(f"/sessions/{eid}/occupations/preview", json={})
+        etoken = r.json()["snapshot_token"]
+        check("空变更预演发放快照", r.status_code == 200, r.text)
+        # 收缩 y 的支持集合 {1,2,3}：当前版 y=4 在当前能力下不可用
+        r = c.put(f"/sessions/{eid}/groups/support",
+                  json={"groups": [
+                      {"group_id": e2, "config_revision": 1,
+                       "supported_frequencies": [1, 2, 3]}]})
+        check("收缩 y 能力", r.status_code == 200, r.text)
+        # 旧快照立即失效 -> 409 snapshot_conflict
+        r = c.post(f"/sessions/{eid}/occupations/confirm",
+                   json={"snapshot_token": etoken})
+        check("能力变化使旧调整快照失效(409)", r.status_code == 409
+              and r.json()["detail"]["error"] == "snapshot_conflict", r.text)
+        check("冲突确认不产生新版本",
+              [p["version"] for p in c.get(
+                  f"/sessions/{eid}/plans").json()] == [1], r.text)
+        # 重新预演（空变更）：y=4 属不支持；替代分配只能落在支持集合内，
+        # 最小改频两组 -> 字典序最小 (x=4,y=1)
+        r = c.post(f"/sessions/{eid}/occupations/preview", json={})
+        check("能力收缩后预演报告不支持组",
+              r.status_code == 200
+              and r.json()["violations"]["unsupported"] == [
+                  {"group_id": e2, "frequency": 4}]
+              and r.json()["violating_groups"] == [e2], r.text)
+        pv = r.json()
+        check("替代分配遵守支持集合",
+              {x["group_id"]: x["frequency"]
+               for x in pv["replacement_assignment"]} == {e1: 4, e2: 1}
+              and pv["changed_groups"] == [e1, e2], str(pv))
+        # 确认 -> 原子发布 v2，占用不变
+        r = c.post(f"/sessions/{eid}/occupations/confirm",
+                   json={"snapshot_token": pv["snapshot_token"]})
+        check("能力违规确认后发布 v2",
+              r.status_code == 200 and r.json()["version"] == 2
+              and r.json()["replacement_published"] is True
+              and {x["group_id"]: x["frequency"]
+                   for x in r.json()["assignments"]} == {e1: 4, e2: 1},
+              r.text)
+        check("v1 历史发布版保持原样",
+              {x["group_id"]: x["frequency"]
+               for x in c.get(f"/sessions/{eid}/plans/1").json()[
+                   "assignments"]} == {e1: 1, e2: 4}, r.text)
+
+        # 能力下无可行替代 -> 预演 422 不发令牌、占用与当前版不变
+        # 再加一组 z 与 x、y 都相交且只支持 {9}? 用更直接构造：x 只支持 {4}、
+        # y 只支持 {2}，间距 3 不可满足。
+        r = c.put(f"/sessions/{eid}/groups/support",
+                  json={"groups": [
+                      {"group_id": e1, "config_revision": 1,
+                       "supported_frequencies": [4]},
+                      {"group_id": e2, "config_revision": 2,
+                       "supported_frequencies": [2]}]})
+        check("两组能力互斥更新成功", r.status_code == 200, r.text)
+        r = c.post(f"/sessions/{eid}/occupations/preview", json={})
+        check("能力下无可行替代(422)且报告涉及组",
+              r.status_code == 422
+              and r.json()["detail"]["error"] == "unsatisfiable"
+              and {g["group_id"] for g in r.json()["detail"][
+                  "unsupported_groups"]} == {e1, e2}
+              and "snapshot_token" not in r.json()["detail"], r.text)
+        check("无解预演后当前发布版与占用不变",
+              [p["version"] for p in c.get(
+                  f"/sessions/{eid}/plans").json()] == [1, 2]
+              and c.get(f"/sessions/{eid}/occupations").json() == [], r.text)
+
+        # ---------------------------------------------------------------- #
+        # 逐组切换路线遵守当前支持集合；旧版不可用时报告涉及组
+        # ---------------------------------------------------------------- #
+        r = c.post("/sessions", json={"name": "能力切换演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6, 7]})
+        rid2 = r.json()["id"]
+        r = c.post(f"/sessions/{rid2}/groups",
+                   json={"name": "p", "start": 0, "end": 100})
+        r1 = r.json()["id"]
+        r = c.post(f"/sessions/{rid2}/groups",
+                   json={"name": "q", "start": 0, "end": 100})
+        r2g = r.json()["id"]
+        c.post(f"/sessions/{rid2}/interferences",
+               json={"group_a": r1, "group_b": r2g, "min_separation": 3})
+        # v1=(1,4)，v2=(4,1)
+        c.post(f"/sessions/{rid2}/plans",
+               json={"base_version": 0, "locks": []})
+        c.post(f"/sessions/{rid2}/plans",
+               json={"base_version": 1,
+                     "locks": [{"group_id": r1, "frequency": 4},
+                               {"group_id": r2g, "frequency": 1}]})
+        # 收缩 q 能力为 {1,2,3}：v1 的 q=4 越界 -> endpoint_infeasible 报组
+        r = c.put(f"/sessions/{rid2}/groups/support",
+                  json={"groups": [
+                      {"group_id": r2g, "config_revision": 1,
+                       "supported_frequencies": [1, 2, 3]}]})
+        check("收缩 q 能力（切换演示）", r.status_code == 200, r.text)
+        r = c.post(f"/sessions/{rid2}/retune",
+                   json={"start_version": 1, "target_version": 2})
+        check("旧版在当前能力下端点不可行(422)并报告涉及组",
+              r.status_code == 422
+              and r.json()["detail"]["error"] == "endpoint_infeasible"
+              and r.json()["detail"]["start"]["unsupported"] == [
+                  {"group_id": r2g, "frequency": 4}]
+              and r.json()["detail"]["target"]["unsupported"] == [], r.text)
+        # 恢复能力后：p 支持 {1,4}、q 支持 {1,4} -> 两端点可行但无临时频点，
+        # 不存在安全路线
+        r = c.put(f"/sessions/{rid2}/groups/support",
+                  json={"groups": [
+                      {"group_id": r1, "config_revision": 1,
+                       "supported_frequencies": [1, 4]},
+                      {"group_id": r2g, "config_revision": 2,
+                       "supported_frequencies": [1, 4]}]})
+        check("两组能力限定 {1,4}", r.status_code == 200, r.text)
+        r = c.post(f"/sessions/{rid2}/retune",
+                   json={"start_version": 1, "target_version": 2})
+        check("能力冻结导致无安全路线(422)",
+              r.status_code == 422
+              and r.json()["detail"]["error"] == "no_safe_route", r.text)
+        # q 重新支持临时频点 7：路线恢复，且所有步骤频点均在各组支持集合内
+        r = c.put(f"/sessions/{rid2}/groups/support",
+                  json={"groups": [
+                      {"group_id": r2g, "config_revision": 3,
+                       "supported_frequencies": [1, 4, 7]}]})
+        check("q 恢复临时频点 7", r.status_code == 200, r.text)
+        r = c.post(f"/sessions/{rid2}/retune",
+                   json={"start_version": 1, "target_version": 2})
+        check("支持集合内存在安全路线(200)", r.status_code == 200, r.text)
+        support = {r1: {1, 4}, r2g: {1, 4, 7}}
+        check("路线每个中间步骤都遵守支持集合",
+              all(s["frequency"] in support[s["group_id"]]
+                  for s in r.json()["steps"])
+              and [(s["group_id"], s["frequency"])
+                   for s in r.json()["steps"]]
+              == [(r2g, 7), (r1, 4), (r2g, 1)], r.text)
+
+        # ---------------------------------------------------------------- #
+        # 实测批次：不支持频点照实留存并标记；已固化批次不因能力变化重算
+        # ---------------------------------------------------------------- #
+        # 沿用 eid 场次（当前 v2=(4,1)，x 支持 {4}、y 支持 {2}）。
+        # 先提交批次 1：x=4、y=1（与 v2 一致；y=1 不在其支持 {2} 内 -> 异常）
+        r = c.post(f"/sessions/{eid}/measurements",
+                   json={"plan_version": 2, "batch_no": 1, "readings": [
+                       {"group_id": e1, "frequency": 4},
+                       {"group_id": e2, "frequency": 1}]})
+        check("实测批次照实留存不支持频点并标记",
+              r.status_code == 201
+              and r.json()["unsupported_frequencies"] == [
+                  {"group_id": e2, "frequency": 1}]
+              and any(x["group_id"] == e2 and x["frequency"] == 1
+                      for x in r.json()["readings"])
+              and "unsupported_frequency" in r.json()["anomalies"], r.text)
+        b1cap = r.json()
+        check("批次固化当时的组能力快照(修订号)",
+              {s["group_id"]: s["config_revision"]
+               for s in b1cap["supported_snapshot"]} == {e1: 2, e2: 3},
+              str(b1cap.get("supported_snapshot")))
+        # 再收缩 y 能力为 {1}（y=1 变为支持）：历史批次不重算，异常结论不变
+        r = c.put(f"/sessions/{eid}/groups/support",
+                  json={"groups": [
+                      {"group_id": e2, "config_revision": 3,
+                       "supported_frequencies": [1]}]})
+        check("再次收缩 y 能力", r.status_code == 200, r.text)
+        r = c.get(f"/sessions/{eid}/measurements/1")
+        check("已固化批次不因能力变化重算",
+              r.json()["unsupported_frequencies"]
+              == b1cap["unsupported_frequencies"]
+              and r.json()["anomalies"] == b1cap["anomalies"]
+              and r.json()["id"] == b1cap["id"], r.text)
+        # 新批次在当前能力下核对：y=1 已支持 -> 无不支持异常；
+        # 频点 3 属场次可用但 y 不支持 -> 照实留存并标记
+        r = c.post(f"/sessions/{eid}/measurements",
+                   json={"plan_version": 2, "batch_no": 2, "readings": [
+                       {"group_id": e1, "frequency": 4},
+                       {"group_id": e2, "frequency": 3}]})
+        check("新批次按当前能力标记不支持频点",
+              r.status_code == 201
+              and r.json()["unsupported_frequencies"] == [
+                  {"group_id": e2, "frequency": 3}]
+              and any(x["group_id"] == e2 and x["frequency"] == 3
+                      for x in r.json()["readings"]), r.text)
         print()
         if _failures:
             print(f"{len(_failures)} 项失败: {_failures}")

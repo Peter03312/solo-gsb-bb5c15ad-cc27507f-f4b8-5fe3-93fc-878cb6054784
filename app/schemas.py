@@ -15,6 +15,24 @@ class GroupCreate(BaseModel):
     name: str = ""
     start: int = Field(description="使用时段起点（分钟，左闭）")
     end: int = Field(description="使用时段终点（分钟，右开）")
+    supported_frequencies: list[int] | None = Field(
+        default=None,
+        description="可选：该组设备实际可调谐的频点；须是场次可用频点的"
+                    "非空子集。未填写（null/省略）视为支持场次全部频点")
+
+
+class GroupSupportItem(BaseModel):
+    group_id: int = Field(description="待变更支持集合的设备组编号")
+    config_revision: int = Field(
+        ge=1, description="所见配置修订号；与当前值不一致即过期拒绝（409）")
+    # 不加 min_length：空集合属于领域校验，由接口返回 400（非空子集）
+    supported_frequencies: list[int] = Field(
+        description="新的支持频点集合；须是场次可用频点的非空子集")
+
+
+class GroupSupportUpdate(BaseModel):
+    groups: list[GroupSupportItem] = Field(
+        min_length=1, description="按组变更支持集合；同一组不得重复出现")
 
 
 class InterferenceCreate(BaseModel):

@@ -12,9 +12,12 @@ from app.solver import SolverLimitExceeded
 
 FREQS = [1, 2, 3, 4, 5, 6]
 GROUPS = [
-    {"id": 1, "start": 0, "end": 120},
-    {"id": 2, "start": 60, "end": 180},
-    {"id": 3, "start": 120, "end": 240},
+    {"id": 1, "start": 0, "end": 120, "supported": list(FREQS),
+     "config_revision": 1},
+    {"id": 2, "start": 60, "end": 180, "supported": list(FREQS),
+     "config_revision": 1},
+    {"id": 3, "start": 120, "end": 240, "supported": list(FREQS),
+     "config_revision": 1},
 ]
 EDGES = [(1, 2, 3), (2, 3, 3)]  # 1-3 时段不相交（左闭右开端点相接），不生效
 # 无占用时的字典序最小发布：(1=1, 2=4, 3=1)
@@ -171,6 +174,45 @@ class TestPreview:
         assert pv["replacement"][2] == 5
 
 
+class TestPreviewCapabilities:
+    """组能力收缩：当前版频点超出当前支持集合时按违规处理并给替代分配。"""
+
+    def test_shrunk_support_flags_unsupported_and_retunes(self):
+        # 当前版 (1,4,1)；组2 能力收缩为 {1,2,3}：频点 4 越界，组2 须改频；
+        # 但组2 取 1/2/3 时与两侧组1、组3（当前均为 1）无法同时保持间距 3，
+        # 故三组都要改；最小改频下字典序最小解为 (4,1,4)。
+        groups = [dict(GROUPS[0]),
+                  {**GROUPS[1], "supported": [1, 2, 3],
+                   "config_revision": 2},
+                  dict(GROUPS[2])]
+        pv = compute_preview(
+            frequencies=FREQS, groups=groups, edges=EDGES,
+            current_assignment=CURRENT, locks={}, occupations=[],
+            revoke=[], register=[])
+        assert pv["detail"]["unsupported"] == [
+            {"group_id": 2, "frequency": 4}]
+        assert pv["violating_groups"] == [2]
+        assert pv["replacement"] == {1: 4, 2: 1, 3: 4}
+        assert pv["changed_groups"] == [1, 2, 3]
+        # 替代分配的每个频点都在该组当前支持集合内
+        for g in groups:
+            assert pv["replacement"][g["id"]] in g["supported"]
+
+    def test_shrunk_support_can_be_unsatisfiable(self):
+        # 两组全程重叠、间距 3；组1 支持 {1}、组2 支持 {2}：基础约束无解
+        groups = [{"id": 1, "start": 0, "end": 100, "supported": [1],
+                   "config_revision": 2},
+                  {"id": 2, "start": 0, "end": 100, "supported": [2],
+                   "config_revision": 1}]
+        with pytest.raises(AdjustmentUnsat) as exc:
+            compute_preview(
+                frequencies=[1, 2, 3, 4, 5], groups=groups,
+                edges=[(1, 2, 3)], current_assignment={1: 1, 2: 4},
+                locks={}, occupations=[], revoke=[], register=[])
+        analysis = exc.value.analysis
+        assert {g["group_id"] for g in analysis["unsupported_groups"]} == {1, 2}
+
+
 class TestFingerprintsAndToken:
     def _state(self, occupations=()):
         return dict(current_version=2, frequencies=FREQS, groups=GROUPS,
@@ -187,8 +229,26 @@ class TestFingerprintsAndToken:
         changed["occupations"] = [occ(1, 1, 0, 10)]
         assert state_fingerprint(**changed) != base
         changed = self._state()
-        changed["groups"] = GROUPS + [{"id": 4, "start": 0, "end": 9}]
+        changed["groups"] = GROUPS + [
+            {"id": 4, "start": 0, "end": 9, "supported": list(FREQS),
+             "config_revision": 1}]
         assert state_fingerprint(**changed) != base
+
+    def test_state_fingerprint_changes_with_group_capability(self):
+        # 组能力（支持集合或配置修订号）变化即改变指纹：旧调整快照失效
+        base = state_fingerprint(**self._state())
+        changed = self._state()
+        changed["groups"] = [
+            dict(g) for g in GROUPS[:-1]] + [
+                {**GROUPS[-1], "supported": [1, 2, 3],
+                 "config_revision": 2}]
+        assert state_fingerprint(**changed) != base
+        # 仅修订号变化（支持集合回填值不变）同样失效
+        changed2 = self._state()
+        changed2["groups"] = [
+            {**g, "config_revision": g["config_revision"] + 1}
+            for g in GROUPS]
+        assert state_fingerprint(**changed2) != base
 
     def test_state_fingerprint_stable_for_same_state(self):
         occupations = [occ(2, 3, 0, 10), occ(1, 1, 5, 9)]

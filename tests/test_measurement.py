@@ -25,9 +25,36 @@ class TestAnalyzeMeasurement:
             {"group_id": 3, "frequency": 1}]
         assert result["deviations"] == []
         assert result["unavailable_frequencies"] == []
+        assert result["unsupported_frequencies"] == []
         assert result["interference_violations"] == []
         assert result["occupation_conflicts"] == []
         assert result["anomalies"] == []
+
+    def test_unsupported_frequency_recorded_as_anomaly(self):
+        # 频点属于场次可用集合，但不在组当前支持集合内：照实留存并标记
+        groups = _groups()
+        groups[1] = {**groups[1], "supported": [1, 2, 3]}
+        result = analyze_measurement(
+            groups, {1: 1, 2: 5, 3: 1},
+            available=set(range(1, 7)),
+            plan_assignment={1: 1, 2: 4, 3: 1},
+            interferences=[], occupations=[])
+        assert result["unsupported_frequencies"] == [
+            {"group_id": 2, "frequency": 5}]
+        assert result["unavailable_frequencies"] == []
+        assert set(result["anomalies"]) == {"deviation",
+                                            "unsupported_frequency"}
+
+    def test_unavailable_frequency_not_double_counted_as_unsupported(self):
+        # 场次外频点只计入 unavailable，不同时计入 unsupported
+        groups = [{**g, "supported": [1, 2]} for g in _groups()]
+        result = analyze_measurement(
+            groups, {1: 99, 2: 2, 3: 2},
+            available={1, 2}, plan_assignment={1: 1, 2: 2, 3: 2},
+            interferences=[], occupations=[])
+        assert result["unavailable_frequencies"] == [
+            {"group_id": 1, "frequency": 99}]
+        assert result["unsupported_frequencies"] == []
 
     def test_deviations_from_plan(self):
         result = analyze_measurement(

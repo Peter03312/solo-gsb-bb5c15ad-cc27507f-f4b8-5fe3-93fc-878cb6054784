@@ -14,8 +14,32 @@ CREATE TABLE IF NOT EXISTS groups (
     name         TEXT NOT NULL DEFAULT '',
     start_min    INTEGER NOT NULL,            -- 使用时段起点（分钟，左闭）
     end_min      INTEGER NOT NULL,            -- 使用时段终点（分钟，右开）
-    CHECK (start_min < end_min)
+    -- 该组设备实际可调谐的频点集合：NULL 表示录入时未填写，视为支持场次全部
+    -- 可用频点；非空时须是场次可用频点的非空子集（子集由应用层校验）。
+    supported_frequencies INTEGER[],
+    -- 组支持集合的配置修订号：录入即为 1，每次按组变更支持集合递增 1；
+    -- 变更必须携带所见修订号，过期提交拒绝（乐观并发控制）。
+    config_revision INTEGER NOT NULL DEFAULT 1,
+    CHECK (start_min < end_min),
+    CHECK (supported_frequencies IS NULL
+           OR cardinality(supported_frequencies) > 0)
 );
+
+-- 既有库幂等升级：补列（全新库建表已含则跳过）。
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS supported_frequencies INTEGER[];
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS config_revision INTEGER NOT NULL DEFAULT 1;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'groups_supported_nonempty'
+    ) THEN
+        ALTER TABLE groups
+            ADD CONSTRAINT groups_supported_nonempty
+            CHECK (supported_frequencies IS NULL
+                   OR cardinality(supported_frequencies) > 0);
+    END IF;
+END$$;
 
 CREATE TABLE IF NOT EXISTS interferences (
     id             SERIAL PRIMARY KEY,

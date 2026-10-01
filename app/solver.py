@@ -2,13 +2,14 @@
 
 求解目标（按优先级）：
 1. 满足全部约束：时段相交的干扰组频点间距 >= 最小间距；锁定组使用指定频点；
-   每个组全程只用一个频点，且频点属于场次可用集合；设备组时段与外部设备占用
-   时段相交（左闭右开）时，被占用的频点不可选用。
+   每个组全程只用一个频点，且频点属于该组支持的调谐集合（未填写时为场次
+   全部可用频点）；设备组时段与外部设备占用时段相交（左闭右开）时，被占用
+   的频点不可选用。
 2. 最小化与前一发布版相比“共有组”的改频数（无前一版时该目标恒为 0）。
 3. 仍有并列时，按组编号升序排列的频点序列取字典序最小方案。
 
-另提供无解分析：给出一个不可约的锁定组子集或冲突约束子集（干扰关系/占用），
-用于向调用方说明导致无解的原因。
+另提供无解分析：给出一个不可约的锁定组子集或冲突约束子集（干扰关系/占用/
+组能力），用于向调用方说明导致无解的原因。
 """
 
 from __future__ import annotations
@@ -50,6 +51,21 @@ def build_forbidden(groups, occupations):
     return forbidden
 
 
+def build_supported(groups, frequencies):
+    """从组信息列表展开每组的有效可调谐频点集合。
+
+    组字典含 ``supported``（有效支持集合，已由 API 层在未填写时回填为场次
+    全部频点）；缺该键的组视为支持全部场次频点。
+    """
+    full = set(frequencies)
+    supported = {}
+    for g in groups:
+        gid = g["id"] if isinstance(g, dict) else g[0]
+        freqs = g.get("supported") if isinstance(g, dict) else None
+        supported[gid] = set(freqs) if freqs else set(full)
+    return supported
+
+
 class FrequencySolver:
     """对单个场次的一次规划求解。
 
@@ -60,13 +76,20 @@ class FrequencySolver:
     :param previous:    前一发布版的分配 {group_id: frequency}，仅共有组参与
                         改频数统计；无前一版时传 None（改频数目标恒为 0）。
     :param forbidden:   每个组因外部设备占用而禁用的频点 {group_id: set}。
+    :param supported:   每个组的可调谐频点集合 {group_id: set}；缺省（或未列
+                        出的组）表示支持场次全部频点。组域 = 支持集合 - 占用
+                        禁用频点；锁定频点不在支持集合内时该组域为空。
     """
 
     def __init__(self, group_ids, frequencies, edges, previous=None,
-                 forbidden=None, max_nodes: int = 2_000_000):
+                 forbidden=None, supported=None, max_nodes: int = 2_000_000):
         self.groups = sorted(set(group_ids))
         self.frequencies = sorted(set(frequencies))
         self.previous = dict(previous or {})
+        self.supported = {g: set(self.frequencies) for g in self.groups}
+        for gid, freqs in (supported or {}).items():
+            if gid in self.supported:
+                self.supported[gid] = set(freqs)
         self.forbidden = {g: set() for g in self.groups}
         for gid, freqs in (forbidden or {}).items():
             if gid in self.forbidden:
@@ -89,14 +112,15 @@ class FrequencySolver:
                 f"search exceeded {self.max_nodes} nodes")
 
     def _initial_domains(self, locks):
-        domains = {g: set(self.frequencies) - self.forbidden[g]
+        domains = {g: self.supported[g] - self.forbidden[g]
                    for g in self.groups}
         available = set(self.frequencies)
         for g, f in locks.items():
-            # 锁定不可用/被占用频点时域为空，搜索会立即判无解（API 层已先行
-            # 拒绝不可用频点；被占用频点在 422 无解分析中说明相关占用）
+            # 锁定不可用/不支持/被占用频点时域为空，搜索会立即判无解（API 层
+            # 已先行拒绝不可用与不支持频点；被占用频点在 422 分析中说明相关占用）
             if g in domains:
-                domains[g] = {f} & available - self.forbidden[g]
+                domains[g] = {f} & available & self.supported[g] \
+                    - self.forbidden[g]
         return domains
 
     def _change_cost(self, group, value):
@@ -200,22 +224,37 @@ def _minimize_core(unsat, items):
 
 
 def analyze_unsat(group_ids, frequencies, edges, locks, previous=None,
-                  occupations=(), group_intervals=None):
+                  occupations=(), group_intervals=None, supported=None):
     """分析无解原因，返回结构化说明。
 
-    - 若去掉锁定后仍无解：在“干扰关系 + 占用”并集上求不可约约束子集，
-      含占用记录时 ``cause`` 为 ``"occupations"``，否则为 ``"interferences"``；
-    - 否则：返回不可约的锁定子集，并附上涉及这些锁定组的干扰关系与占用。
+    - 若去掉锁定后仍无解：在“组能力（支持集合为场次频点的真子集）+ 干扰关系
+      + 占用”并集上求不可约约束子集；含占用记录时 ``cause`` 为
+      ``"occupations"``，否则为 ``"interferences"``（组能力单独列出，不影响
+      cause 归因）；
+    - 否则：返回不可约的锁定子集，并附上涉及这些锁定组的干扰关系、占用与
+      组能力说明。
+
+    任一分支都会在 ``unsupported_groups`` 中给出核心中受当前支持集合约束的
+    组（及其支持集合），用于在能力收缩导致旧版/约束无解时报告“涉及组”。
 
     :param occupations: 占用记录字典列表（含 ``id``/``frequency``/``start``/
                         ``end``）；与设备组时段相交的占用构成该组的禁用频点。
     :param group_intervals: {group_id: (start, end)}，用于判定占用与哪些组相交；
                         提供占用时必须给出。
+    :param supported: 每个组的可调谐频点 {group_id: 可迭代频点}；缺省表示支持
+                        场次全部频点。
     """
     locks = dict(locks or {})
     occupations = list(occupations or [])
     groups = sorted(set(group_ids))
     intervals = group_intervals or {}
+    available = set(frequencies)
+    supported_map = {g: set(available) for g in groups}
+    for gid, freqs in (supported or {}).items():
+        if gid in supported_map:
+            supported_map[gid] = set(freqs) & available
+    # 只有真子集才作为额外一元约束进入核心分析
+    cap_groups = sorted(g for g in groups if supported_map[g] != available)
 
     # 每条占用对哪些组禁用哪个频点
     occ_blocks: list[dict[int, int]] = []
@@ -236,18 +275,41 @@ def analyze_unsat(group_ids, frequencies, edges, locks, previous=None,
                 forbidden[gid].add(freq)
         return forbidden
 
-    def unsat_with(lock_list, edge_list, occ_indices=frozenset()):
+    def make_supported(cap_indices):
+        active = set(cap_indices)
+        return {g: (supported_map[g] if g in active else available)
+                for g in groups}
+
+    def unsat_with(lock_list, edge_list, occ_indices=frozenset(),
+                   cap_indices=frozenset()):
         solver = FrequencySolver(
             groups, frequencies, edge_list, previous,
-            forbidden=make_forbidden(occ_indices))
+            forbidden=make_forbidden(occ_indices),
+            supported=make_supported(cap_indices))
         return solver.solve(dict(lock_list)) is None
 
-    if not unsat_with([], edges, range(len(occupations))):
-        # 基础约束可满足：无解由锁定引入，最小化锁定子集
-        core_locks = _minimize_core(
-            lambda ls: unsat_with(ls, edges, range(len(occupations))),
-            sorted(locks.items()))
-        core_groups = {g for g, _ in core_locks}
+    def cap_public(gid):
+        return {"group_id": gid,
+                "supported_frequencies": sorted(supported_map[gid])}
+
+    all_occ = range(len(occupations))
+
+    if not unsat_with([], edges, all_occ, cap_groups):
+        # 基础约束可满足：无解由锁定引入。联合最小化“锁定 + 组能力”：能力
+        # 本身可满足，但可能与锁定共同构成不可约核心（锁定频点不被支持时
+        # API 层已先行 400，这里只保留需要报告的防御性路径）。
+        items: list[tuple] = [("l", item) for item in sorted(locks.items())]
+        items += [("c", gid) for gid in cap_groups]
+
+        def unsat_locks(trial):
+            lock_list = [p for k, p in trial if k == "l"]
+            caps = [p for k, p in trial if k == "c"]
+            return unsat_with(lock_list, edges, all_occ, caps)
+
+        core_items = _minimize_core(unsat_locks, items)
+        core_locks = [p for k, p in core_items if k == "l"]
+        core_caps = sorted({p for k, p in core_items if k == "c"})
+        core_groups = {g for g, _ in core_locks} | set(core_caps)
         related_edges = [e for e in edges if e[0] in core_groups
                          or e[1] in core_groups]
         related_occ = []
@@ -266,21 +328,24 @@ def analyze_unsat(group_ids, frequencies, edges, locks, previous=None,
                 {"group_a": a, "group_b": b, "min_separation": s}
                 for a, b, s in related_edges],
             "occupations": [_occ_public(o) for o in related_occ],
+            "unsupported_groups": [cap_public(g) for g in core_caps],
         }
 
-    # 基础约束本身不可满足：在 干扰关系 + 占用 上联合最小化
-    items: list[tuple] = [("e", e) for e in edges]
+    # 基础约束本身不可满足：在 组能力 + 干扰关系 + 占用 上联合最小化
+    items = [("c", gid) for gid in cap_groups]
+    items += [("e", e) for e in edges]
     items += [("o", idx) for idx in range(len(occupations)) if occ_blocks[idx]]
 
     def unsat_items(trial):
-        edge_list = [payload for kind, payload in trial if kind == "e"]
-        occ_indices = [payload for kind, payload in trial if kind == "o"]
-        return unsat_with([], edge_list, occ_indices)
+        cap_indices = [p for k, p in trial if k == "c"]
+        edge_list = [p for k, p in trial if k == "e"]
+        occ_indices = [p for k, p in trial if k == "o"]
+        return unsat_with([], edge_list, occ_indices, cap_indices)
 
     core_items = _minimize_core(unsat_items, items)
-    core_edges = [payload for kind, payload in core_items if kind == "e"]
-    core_occ_indices = sorted(payload for kind, payload in core_items
-                              if kind == "o")
+    core_caps = sorted({p for k, p in core_items if k == "c"})
+    core_edges = [p for k, p in core_items if k == "e"]
+    core_occ_indices = sorted(p for k, p in core_items if k == "o")
     cause = "occupations" if core_occ_indices else "interferences"
     return {
         "cause": cause,
@@ -289,6 +354,7 @@ def analyze_unsat(group_ids, frequencies, edges, locks, previous=None,
             {"group_a": a, "group_b": b, "min_separation": s}
             for a, b, s in core_edges],
         "occupations": [_occ_public(occupations[i]) for i in core_occ_indices],
+        "unsupported_groups": [cap_public(g) for g in core_caps],
     }
 
 

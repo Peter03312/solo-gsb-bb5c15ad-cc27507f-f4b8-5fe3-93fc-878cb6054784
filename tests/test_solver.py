@@ -184,6 +184,69 @@ class TestAnalyzeUnsatOccupations:
         assert {o["id"] for o in result["occupations"]} == {5}
 
 
+class TestSupportedFrequencies:
+    def test_support_restricts_domain_lex_minimum(self):
+        # 组2 不支持频点 4：字典序最小解由 (1,4) 变为 (1,5)
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            supported={2: {1, 2, 3, 5, 6}})
+        assignment, _ = solver.solve()
+        assert (assignment[1], assignment[2]) == (1, 5)
+
+    def test_support_single_frequency_per_group(self):
+        # 两组各只支持一个频点且间距满足：直接取该频点
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            supported={1: {2}, 2: {5}})
+        assignment, _ = solver.solve()
+        assert assignment == {1: 2, 2: 5}
+
+    def test_support_makes_unsat(self):
+        # 组1 只支持 {1}、组2 只支持 {2}：间距 3 不可满足
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            supported={1: {1}, 2: {2}})
+        assert solver.solve() is None
+
+    def test_lock_outside_support_unsat(self):
+        solver = FrequencySolver(
+            [1], list(range(1, 7)), [], supported={1: {1, 2, 3}})
+        assert solver.solve({1: 5}) is None
+
+    def test_support_respected_with_previous(self):
+        # 前版 (1,4)；组2 不再支持 4、5 -> 最小改频下组2 取 6（|6-1|>=3）
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            previous={1: 1, 2: 4}, supported={2: {1, 2, 3, 6}})
+        assignment, changes = solver.solve()
+        assert assignment == {1: 1, 2: 6}
+        assert changes == 1
+
+    def test_analyze_unsat_capability_core(self):
+        result = analyze_unsat(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)], {},
+            supported={1: {1}, 2: {2}})
+        assert {g["group_id"] for g in result["unsupported_groups"]} == {1, 2}
+        # 原因来自能力而非占用
+        assert result["cause"] == "interferences"
+        assert result["occupations"] == []
+
+    def test_analyze_unsat_capability_with_occupation_cause(self):
+        # 单组只支持 {1,2}，而 1、2 两频点在其时段均被占用：能力与两条占用
+        # 共同构成不可约核心，cause 按占用归因，涉及组照样在 unsupported 列出
+        intervals = {1: (0, 100)}
+        occupations = [
+            {"id": 4, "frequency": 1, "start": 0, "end": 100},
+            {"id": 5, "frequency": 2, "start": 0, "end": 100}]
+        result = analyze_unsat(
+            [1], [1, 2, 3, 4, 5], [], {},
+            occupations=occupations, group_intervals=intervals,
+            supported={1: {1, 2}})
+        assert result["cause"] == "occupations"
+        assert {g["group_id"] for g in result["unsupported_groups"]} == {1}
+        assert {o["id"] for o in result["occupations"]} == {4, 5}
+
+
 class TestAnalyzeUnsat:
     def test_interference_core(self):
         # 三组两两间距 2、频点 {1,2,3}：任意两条关系可行，三条齐备则不可行

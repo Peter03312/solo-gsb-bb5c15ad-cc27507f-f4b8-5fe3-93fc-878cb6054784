@@ -127,14 +127,17 @@ def _sha(payload) -> str:
 
 def state_fingerprint(*, current_version, frequencies, groups, interferences,
                       occupations):
-    """计算覆盖发布版号、可用频点、设备组时段、干扰关系与当前占用的指纹。
+    """计算覆盖发布版号、可用频点、设备组时段与支持集合（含配置修订号）、
+    干扰关系和当前占用的指纹。
 
-    任一项变化都会改变指纹，确认时据此判定“版本、配置或占用有变化”的冲突。
+    任一项变化都会改变指纹，确认时据此判定“版本、配置或占用有变化”的冲突；
+    组支持集合或其配置修订号变化同样使旧的占用调整快照失效。
     """
     return _sha({
         "current_version": current_version,
         "frequencies": sorted(frequencies),
-        "groups": sorted([g["id"], g["start"], g["end"]] for g in groups),
+        "groups": sorted([g["id"], g["start"], g["end"], g["config_revision"],
+                          sorted(g["supported"])] for g in groups),
         "interferences": sorted(
             list(sorted((i["group_a"], i["group_b"])))
             + [i["min_separation"]] for i in interferences),
@@ -218,6 +221,7 @@ def violation_detail(bad, groups, occupations):
     """在违规明细上补全相关占用引用（真实编号或待登记序号）。"""
     groups_by_id = {g["id"]: g for g in groups}
     return {
+        "unsupported": list(bad.get("unsupported", ())),
         "unavailable": list(bad["unavailable"]),
         "interferences": list(bad["interferences"]),
         "occupations": [
@@ -230,7 +234,8 @@ def violation_detail(bad, groups, occupations):
 
 def violating_group_ids(bad) -> list[int]:
     """汇总当前版在变更后违反约束的全部组编号（升序去重）。"""
-    groups = {item["group_id"] for item in bad["unavailable"]}
+    groups = {item["group_id"] for item in bad.get("unsupported", ())}
+    groups |= {item["group_id"] for item in bad["unavailable"]}
     groups |= {item["group_id"] for item in bad["occupations"]}
     for edge in bad["interferences"]:
         groups.add(edge["group_a"])
@@ -242,11 +247,11 @@ def violating_group_ids(bad) -> list[int]:
 # 预演核心
 # --------------------------------------------------------------------- #
 def compute_preview(*, frequencies, groups, edges, current_assignment, locks,
-                    occupations, revoke, register):
+                    occupations, revoke, register, supported=None):
     """对一次合法变更做预演。
 
     :param frequencies:        场次可用整数频点。
-    :param groups:             当前设备组字典列表（id/start/end）。
+    :param groups:             当前设备组字典列表（id/start/end/supported）。
     :param edges:              已按时段相交过滤的生效干扰关系
                                [(group_a, group_b, min_separation)]。
     :param current_assignment: 当前发布版分配 {group_id: frequency}。
@@ -254,6 +259,8 @@ def compute_preview(*, frequencies, groups, edges, current_assignment, locks,
                                分配必须原样保留。
     :param occupations:        当前占用列表。
     :param revoke/register:    已通过 :func:`validate_adjustment` 的变更。
+    :param supported:          每组当前可调谐频点 {gid: set}；缺省取各组
+                               ``supported`` 键，再缺省为场次全部频点。
     :returns: dict(
                 resulting_occupations 变更后占用（待登记项为合成编号），
                 detail                违规明细（含相关占用引用），
@@ -264,22 +271,28 @@ def compute_preview(*, frequencies, groups, edges, current_assignment, locks,
     :raises AdjustmentUnsat: 变更后无可行分配（携带无解说明）。
     """
     group_ids = [g["id"] for g in groups]
+    full = set(frequencies)
+    if supported is None:
+        supported = {g["id"]: set(g.get("supported") or full)
+                     for g in groups}
     resulting = apply_adjustment(occupations, revoke, register)
     forbidden = build_forbidden(groups, resulting)
 
     bad = violations(group_ids, dict(current_assignment), edges,
-                     frequencies, forbidden)
-    has_violation = bool(bad["unavailable"] or bad["interferences"]
+                     frequencies, forbidden, supported)
+    has_violation = bool(bad.get("unsupported") or bad["unavailable"]
+                         or bad["interferences"]
                          or bad["occupations"])
 
     replacement = None
     changed_groups: list[int] = []
     if has_violation:
         # “前一版”即当前发布版：求解器据此最小化改频组数并做字典序决胜；
-        # locks 强制保留当前版锁定（被新占用封死时该锁定会导致无解）。
+        # locks 强制保留当前版锁定（被新占用封死或超出当前能力时该锁定会
+        # 导致无解）；替代分配只能落在各组当前支持集合内。
         solver = FrequencySolver(
             group_ids, frequencies, edges, previous=current_assignment,
-            forbidden=forbidden)
+            forbidden=forbidden, supported=supported)
         try:
             solved = solver.solve(dict(locks))
         except SolverLimitExceeded:
@@ -290,7 +303,7 @@ def compute_preview(*, frequencies, groups, edges, current_assignment, locks,
             analysis = analyze_unsat(
                 group_ids, frequencies, edges, dict(locks),
                 previous=current_assignment, occupations=resulting,
-                group_intervals=group_intervals)
+                group_intervals=group_intervals, supported=supported)
             by_id = {o["id"]: o for o in resulting}
             analysis["occupations"] = [
                 occupation_ref(by_id[o["id"]] if "id" in o

@@ -29,8 +29,9 @@ class RetuneLimitExceeded(Exception):
     """搜索状态数超过资源上限。"""
 
 
-def violations(groups, assignment, edges, frequencies, forbidden=None):
-    """返回端点分配的不可行之处：不可用频点、违反的干扰关系与占用冲突。
+def violations(groups, assignment, edges, frequencies, forbidden=None,
+               supported=None):
+    """返回端点分配的不可行之处：不支持/不可用频点、违反的干扰关系与占用冲突。
 
     :param groups:      全部组编号。
     :param assignment:  {group_id: frequency}。
@@ -38,9 +39,19 @@ def violations(groups, assignment, edges, frequencies, forbidden=None):
     :param frequencies: 场次可用频点集合。
     :param forbidden:   {group_id: set(frequencies)}，外部设备占用导致该组
                         时段内禁用的频点（一次一致的当前占用快照）。
+    :param supported:   {group_id: set(frequencies)}，每组设备当前可调谐的频点
+                        集合（未填写时为场次全部频点）。不在支持集合内的频点
+                        记入 ``unsupported``；不在场次集合内的记入
+                        ``unavailable``（两者可同时命中）。
     """
     available = set(frequencies)
     forbidden = forbidden or {}
+    supported = supported or {}
+    unsupported = [
+        {"group_id": g, "frequency": assignment[g]}
+        for g in sorted(groups)
+        if assignment[g] in available
+        and assignment[g] not in supported.get(g, available)]
     unavailable = [
         {"group_id": g, "frequency": assignment[g]}
         for g in sorted(groups) if assignment[g] not in available]
@@ -50,8 +61,8 @@ def violations(groups, assignment, edges, frequencies, forbidden=None):
     bad_occupations = [
         {"group_id": g, "frequency": assignment[g]}
         for g in sorted(groups) if assignment[g] in forbidden.get(g, ())]
-    return {"unavailable": unavailable, "interferences": bad_edges,
-            "occupations": bad_occupations}
+    return {"unsupported": unsupported, "unavailable": unavailable,
+            "interferences": bad_edges, "occupations": bad_occupations}
 
 
 class RetunePlanner:
@@ -66,15 +77,23 @@ class RetunePlanner:
     :param fixed:       切换期间不可调频的组集合。
     :param forbidden:   {group_id: set(frequencies)}，外部设备占用导致该组
                         时段内禁用的频点；起点、终点与每个临时步骤都受其约束。
+    :param supported:   {group_id: set(frequencies)}，每组设备当前可调谐频点
+                        集合；起点、终点与每个临时步骤（含借用的临时频点）都
+                        只能落在该组支持集合内。
     """
 
     def __init__(self, group_ids, frequencies, edges, start, target,
-                 fixed=(), forbidden=None, max_states: int = 200_000):
+                 fixed=(), forbidden=None, supported=None,
+                 max_states: int = 200_000):
         self.groups = sorted(set(group_ids))
         self.frequencies = sorted(set(frequencies))
         self.start = dict(start)
         self.target = dict(target)
         self.fixed = set(fixed)
+        self.supported = {g: set(self.frequencies) for g in self.groups}
+        for gid, freqs in (supported or {}).items():
+            if gid in self.supported:
+                self.supported[gid] = set(freqs)
         self.forbidden = {g: set() for g in self.groups}
         for gid, freqs in (forbidden or {}).items():
             if gid in self.forbidden:
@@ -91,9 +110,9 @@ class RetunePlanner:
     def endpoint_violations(self):
         """检查两个端点是否可行；返回 (起点问题, 终点问题)，均为空才可行。"""
         return (violations(self.groups, self.start, self.edges,
-                           self.frequencies, self.forbidden),
+                           self.frequencies, self.forbidden, self.supported),
                 violations(self.groups, self.target, self.edges,
-                           self.frequencies, self.forbidden))
+                           self.frequencies, self.forbidden, self.supported))
 
     # ------------------------------------------------------------------ #
     # 贪心构造路线长度上界（可达时供 BFS 限深；不可达时不可信）
@@ -128,6 +147,7 @@ class RetunePlanner:
                         bpos = lidx[b]
                         vals = [f for f in self.frequencies
                                 if f != state[bpos]
+                                and f in self.supported[b]
                                 and f not in self.forbidden[b]
                                 and all(
                                     abs(state[lidx[o]] - f) >= sep2
@@ -215,7 +235,8 @@ class RetunePlanner:
                 base = state[:pos]
                 tail = state[pos + 1:]
                 for value in freqs:  # 频点升序；跳过当前频点（空操作不优）
-                    if value == cur or value in self.forbidden[g]:
+                    if value == cur or value in self.forbidden[g] \
+                            or value not in self.supported[g]:
                         continue
                     for o, sep in self.adj[g]:
                         if abs(state[lidx[o]] - value) < sep:
