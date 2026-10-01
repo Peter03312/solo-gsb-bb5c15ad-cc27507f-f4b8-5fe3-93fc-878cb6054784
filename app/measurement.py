@@ -5,6 +5,8 @@
 
 - ``deviations``：实测频点偏离指定发布版的组；
 - ``unavailable``：实测频点不在场次可用集合内的组（仍然如实记录）；
+- ``unsupported``：实测频点在场次可用集合内、但不在该组当前支持频点集合内
+  的组（设备组能力可能在发布后收窄；仍然如实记录）；
 - ``interference_violations``：时段相交（左闭右开）的干扰组，实测频点间距
   小于最小间距的违规关系；
 - ``occupation_conflicts``：实测频点与外部设备占用冲突的组，并给出全部冲突
@@ -20,7 +22,7 @@ from .solver import intervals_overlap
 
 
 def analyze_measurement(groups, readings, available, plan_assignment,
-                        interferences, occupations):
+                        interferences, occupations, supported=None):
     """核对一次实测批次。
 
     :param groups:          当前组信息列表（字典含 id/start/end）。
@@ -31,10 +33,14 @@ def analyze_measurement(groups, readings, available, plan_assignment,
     :param interferences:   干扰关系字典列表（group_a/group_b/
                             min_separation）；仅时段相交时生效。
     :param occupations:     当前占用快照字典列表（id/frequency/start/end）。
+    :param supported:       各组当前支持频点 {group_id: 可迭代频点}；未提供时
+                            视为各组支持场次全部频点。实测频点在场次集合内但
+                            不在该组支持集合中时记 unsupported 异常。
     :returns: 结构化核对结果（键序固定，便于直接固化与对外返回）。
     """
     group_by_id = {g["id"]: g for g in groups}
     available = set(available)
+    supported = {gid: set(freqs) for gid, freqs in (supported or {}).items()}
 
     readings_list = [{"group_id": gid, "frequency": readings[gid]}
                      for gid in sorted(readings)]
@@ -51,6 +57,14 @@ def analyze_measurement(groups, readings, available, plan_assignment,
     unavailable = [
         {"group_id": gid, "frequency": readings[gid]}
         for gid in sorted(readings) if readings[gid] not in available]
+
+    # 2b. 频点在场次集合内、但超出该组当前可调谐范围的组（同样照实留存）
+    unsupported = [
+        {"group_id": gid, "frequency": readings[gid],
+         "supported_frequencies": sorted(supported[gid])}
+        for gid in sorted(readings)
+        if readings[gid] in available
+        and gid in supported and readings[gid] not in supported[gid]]
 
     # 3. 时段相交时违反最小间距的干扰关系（按组编号对归一，便于稳定输出）
     violations = []
@@ -102,6 +116,8 @@ def analyze_measurement(groups, readings, available, plan_assignment,
         anomalies.append("deviation")
     if unavailable:
         anomalies.append("unavailable_frequency")
+    if unsupported:
+        anomalies.append("unsupported_frequency")
     if violations:
         anomalies.append("interference_violation")
     if occupation_conflicts:
@@ -111,6 +127,7 @@ def analyze_measurement(groups, readings, available, plan_assignment,
         "readings": readings_list,
         "deviations": deviations,
         "unavailable_frequencies": unavailable,
+        "unsupported_frequencies": unsupported,
         "interference_violations": violations,
         "occupation_conflicts": occupation_conflicts,
         "anomalies": anomalies,

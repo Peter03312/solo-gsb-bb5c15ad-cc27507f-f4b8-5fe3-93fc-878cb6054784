@@ -148,3 +148,39 @@ class TestAnalyzeMeasurement:
         assert result["anomalies"] == [
             "deviation", "unavailable_frequency",
             "interference_violation", "occupation_conflict"]
+
+
+class TestUnsupportedByGroup:
+    def test_in_session_but_not_supported_flagged(self):
+        # 频点 5 在场次集合内，但组 1 当前能力仅 {1,2,3}：记 unsupported
+        result = analyze_measurement(
+            _groups(), {1: 5, 2: 4, 3: 1},
+            available={1, 2, 3, 4, 5, 6},
+            plan_assignment={1: 1, 2: 4, 3: 1},
+            interferences=[], occupations=[],
+            supported={1: {1, 2, 3}, 2: {1, 2, 3, 4, 5, 6},
+                       3: {1, 2, 3, 4, 5, 6}})
+        assert result["unavailable_frequencies"] == []
+        assert result["unsupported_frequencies"] == [
+            {"group_id": 1, "frequency": 5,
+             "supported_frequencies": [1, 2, 3]}]
+        assert "unsupported_frequency" in result["anomalies"]
+
+    def test_unavailable_not_also_unsupported(self):
+        # 不在场次集合的频点只归 unavailable，不重复计 unsupported
+        result = analyze_measurement(
+            [{"id": 1, "start": 0, "end": 60}], {1: 99},
+            available={1, 2, 3}, plan_assignment={1: 1},
+            interferences=[], occupations=[],
+            supported={1: {1, 2}})
+        assert result["unavailable_frequencies"] == [
+            {"group_id": 1, "frequency": 99}]
+        assert result["unsupported_frequencies"] == []
+
+    def test_default_supported_is_full_set(self):
+        # 未提供 supported：即使计划值偏离也不产生 unsupported
+        result = analyze_measurement(
+            [{"id": 1, "start": 0, "end": 60}], {1: 3},
+            available={1, 2, 3}, plan_assignment={1: 1},
+            interferences=[], occupations=[])
+        assert result["unsupported_frequencies"] == []

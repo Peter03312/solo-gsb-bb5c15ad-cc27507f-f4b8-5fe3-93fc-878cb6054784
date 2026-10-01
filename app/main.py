@@ -14,10 +14,10 @@ from .adjustment import (AdjustmentUnsat, canonical_change,
                          occupation_ref, state_fingerprint,
                          validate_adjustment)
 from .measurement import analyze_measurement
-from .schemas import (GroupCreate, InterferenceCreate, MeasurementCreate,
-                      OccupationAdjustment, OccupationAdjustmentConfirm,
-                      OccupationCreate, PlanCreate, RetuneRequest,
-                      SessionCreate)
+from .schemas import (GroupCreate, GroupSupportedUpdate, InterferenceCreate,
+                      MeasurementCreate, OccupationAdjustment,
+                      OccupationAdjustmentConfirm, OccupationCreate, PlanCreate,
+                      RetuneRequest, SessionCreate)
 from .solver import (FrequencySolver, SolverLimitExceeded, analyze_unsat,
                      build_forbidden, intervals_overlap)
 from .retune import RetunePlanner, RetuneLimitExceeded
@@ -33,11 +33,12 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="频点协调服务",
-    version="1.3.0",
-    description="为临时演出的无线电设备组协调频点：录入场次、设备组时段与"
-                "干扰关系，登记/撤销外部设备频点占用，按约束规划并发布不可"
-                "变的频点分配版本，现场可预演占用调整（快照标识+替代分配）"
-                "并原子确认，并可留存现场实测频点批次、固化核对差异。",
+    version="1.4.0",
+    description="为临时演出的无线电设备组协调频点：录入场次、设备组时段、"
+                "各组可调谐支持频点（按配置修订号乐观锁变更）与干扰关系，"
+                "登记/撤销外部设备频点占用，按约束规划并发布不可变的频点分配"
+                "版本，现场可预演占用调整（快照标识+替代分配）并原子确认，"
+                "并可留存现场实测频点批次、固化核对差异。",
     lifespan=lifespan,
 )
 
@@ -61,29 +62,51 @@ def create_session(payload: SessionCreate, conn=Depends(db.get_conn)):
         row = cur.fetchone()
     conn.commit()
     return {"id": row[0], "name": payload.name,
-            "frequencies": frequencies, "created_at": row[1]}
+            "frequencies": frequencies, "config_revision": 0,
+            "created_at": row[1]}
 
 
 def _load_session(conn, session_id: int, for_update: bool = False):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, name, frequencies, created_at FROM sessions "
-            f"WHERE id = %s {'FOR UPDATE' if for_update else ''}",
+            "SELECT id, name, frequencies, config_revision, created_at "
+            "FROM sessions WHERE id = %s "
+            f"{'FOR UPDATE' if for_update else ''}",
             (session_id,))
         row = cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="场次不存在")
     return {"id": row[0], "name": row[1], "frequencies": list(row[2]),
-            "created_at": row[3]}
+            "config_revision": row[3], "created_at": row[4]}
 
 
 def _load_groups(conn, session_id: int):
+    """读取组信息；supported_frequencies 为生效集合（未填写即场次全部频点），
+    另以 supported_frequencies_set 给出原始 null 与否的区分由调用方按需处理。"""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, name, start_min, end_min FROM groups "
-            "WHERE session_id = %s ORDER BY id", (session_id,))
-        return [{"id": r[0], "name": r[1], "start": r[2], "end": r[3]}
-                for r in cur.fetchall()]
+            "SELECT id, name, start_min, end_min, supported_frequencies "
+            "FROM groups WHERE session_id = %s ORDER BY id", (session_id,))
+        rows = cur.fetchall()
+    return [{"id": r[0], "name": r[1], "start": r[2], "end": r[3],
+             "supported_raw": list(r[4]) if r[4] is not None else None}
+            for r in rows]
+
+
+def _group_public(session: dict, group: dict) -> dict:
+    """组信息对外结构：未填写支持频点时回显场次全部频点。"""
+    supported = (group["supported_raw"] if group["supported_raw"] is not None
+                 else list(session["frequencies"]))
+    return {"id": group["id"], "session_id": session["id"],
+            "name": group["name"], "start": group["start"],
+            "end": group["end"], "supported_frequencies": supported}
+
+
+def _supported_map(session: dict, groups: list[dict]) -> dict[int, set[int]]:
+    """构造 {group_id: 生效支持频点集合}；未填写的组支持场次全部频点。"""
+    available = set(session["frequencies"])
+    return {g["id"]: (set(g["supported_raw"]) if g["supported_raw"]
+                      is not None else set(available)) for g in groups}
 
 
 def _load_interferences(conn, session_id: int):
@@ -116,9 +139,10 @@ def _occ_public(occ: dict) -> dict:
 
 @app.get("/sessions/{session_id}")
 def get_session(session_id: int, conn=Depends(db.get_conn)):
-    """读取场次详情（含设备组、干扰关系与当前占用记录）。"""
+    """读取场次详情（含设备组能力、干扰关系与当前占用记录）。"""
     session = _load_session(conn, session_id)
-    session["groups"] = _load_groups(conn, session_id)
+    groups = _load_groups(conn, session_id)
+    session["groups"] = [_group_public(session, g) for g in groups]
     session["interferences"] = _load_interferences(conn, session_id)
     session["occupations"] = [
         {k: occ[k] for k in ("id", "frequency", "start", "end")}
@@ -132,20 +156,106 @@ def get_session(session_id: int, conn=Depends(db.get_conn)):
 @app.post("/sessions/{session_id}/groups", status_code=201)
 def create_group(session_id: int, payload: GroupCreate,
                  conn=Depends(db.get_conn)):
-    """录入设备组及其使用时段（左闭右开）。"""
+    """录入设备组及其使用时段（左闭右开）。
+
+    可选填 ``supported_frequencies``（该组可调谐范围）：须为场次可用频点的
+    非空子集；未填写（null/缺省）视为支持场次全部频点，与既有组行为一致。
+    """
     # 锁场次行：组集合变化与发布/占用变更串行，保证预演快照覆盖的配置不被并发改写
-    _load_session(conn, session_id, for_update=True)
+    session = _load_session(conn, session_id, for_update=True)
     if payload.start >= payload.end:
         raise bad_request("时段起点必须早于终点（左闭右开）")
+    supported_sorted = None
+    if payload.supported_frequencies is not None:
+        supported_sorted = sorted(set(payload.supported_frequencies))
+        available = set(session["frequencies"])
+        if not supported_sorted or any(
+                f not in available for f in supported_sorted):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "invalid_supported_frequencies",
+                        "message": "支持频点必须是场次可用频点的非空子集",
+                        "supported_frequencies": supported_sorted,
+                        "available_frequencies": session["frequencies"]})
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO groups (session_id, name, start_min, end_min) "
-            "VALUES (%s, %s, %s, %s) RETURNING id",
-            (session_id, payload.name, payload.start, payload.end))
+            "INSERT INTO groups (session_id, name, start_min, end_min, "
+            "supported_frequencies) VALUES (%s, %s, %s, %s, %s) "
+            "RETURNING id",
+            (session_id, payload.name, payload.start, payload.end,
+             supported_sorted))
         group_id = cur.fetchone()[0]
     conn.commit()
-    return {"id": group_id, "session_id": session_id, "name": payload.name,
-            "start": payload.start, "end": payload.end}
+    result = {"id": group_id, "session_id": session_id,
+              "name": payload.name,
+              "start": payload.start, "end": payload.end,
+              "supported_raw": supported_sorted}
+    # 录入组不改变配置修订号（仅“按组变更支持集合”才自增）
+    return _group_public(session, result)
+
+
+@app.get("/sessions/{session_id}/groups/{group_id}")
+def get_group(session_id: int, group_id: int, conn=Depends(db.get_conn)):
+    """读取单个设备组：返回生效支持频点集合与当前配置修订号。"""
+    session = _load_session(conn, session_id)
+    groups = {g["id"]: g for g in _load_groups(conn, session_id)}
+    if group_id not in groups:
+        raise HTTPException(status_code=404, detail="设备组不存在")
+    result = _group_public(session, groups[group_id])
+    result["config_revision"] = session["config_revision"]
+    return result
+
+
+@app.put("/sessions/{session_id}/groups/{group_id}/supported")
+def update_group_supported(session_id: int, group_id: int,
+                           payload: GroupSupportedUpdate,
+                           conn=Depends(db.get_conn)):
+    """变更某设备组的可调谐支持频点集合（乐观锁）。
+
+    - 必须携带所见配置修订号 ``revision``；与当前修订号不一致即 409
+      ``stale_config_revision``，过期提交不覆盖新配置；
+    - 新集合必须是场次可用频点的**非空子集**，否则 400
+      ``invalid_supported_frequencies``；
+    - 与发布、占用登记/撤销、占用调整确认按场次行锁串行；成功后配置修订号
+      自增，使此前的占用调整快照失效。能力收窄不自动重写任何发布版、也不改
+      占用；约束无解的后续操作保持占用与当前发布版不变。
+    """
+    # 锁场次行：组能力变更与发布、占用变更、调整确认互斥串行
+    session = _load_session(conn, session_id, for_update=True)
+    groups = {g["id"]: g for g in _load_groups(conn, session_id)}
+    if group_id not in groups:
+        raise HTTPException(status_code=404, detail="设备组不存在")
+    if payload.revision != session["config_revision"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "stale_config_revision",
+                    "message": "所见配置修订号已过期，请重新读取组信息后提交",
+                    "seen_revision": payload.revision,
+                    "current_revision": session["config_revision"]})
+    new_supported = sorted(set(payload.frequencies))
+    available = set(session["frequencies"])
+    if not new_supported or any(f not in available for f in new_supported):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_supported_frequencies",
+                    "message": "支持频点必须是场次可用频点的非空子集",
+                    "supported_frequencies": new_supported,
+                    "available_frequencies": session["frequencies"]})
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE groups SET supported_frequencies = %s "
+            "WHERE id = %s AND session_id = %s",
+            (new_supported, group_id, session_id))
+        cur.execute(
+            "UPDATE sessions SET config_revision = config_revision + 1 "
+            "WHERE id = %s RETURNING config_revision", (session_id,))
+        new_revision = cur.fetchone()[0]
+    conn.commit()
+    updated = {**groups[group_id], "supported_raw": new_supported}
+    result = _group_public(session, updated)
+    result["config_revision"] = new_revision
+    result["previous_revision"] = payload.revision
+    return result
 
 
 @app.post("/sessions/{session_id}/interferences", status_code=201)
@@ -301,6 +411,7 @@ def _run_preview(conn, session, revoke, register):
     session_id = session["id"]
     groups = _load_groups(conn, session_id)
     group_ids = {g["id"] for g in groups}
+    supported = _supported_map(session, groups)
     interferences = _load_interferences(conn, session_id)
     occupations = _load_occupations(conn, session_id)
     current = _current_version(conn, session_id)
@@ -317,7 +428,8 @@ def _run_preview(conn, session, revoke, register):
         preview = compute_preview(
             frequencies=session["frequencies"], groups=groups, edges=edges,
             current_assignment=current_assignment, locks=locks,
-            occupations=occupations, revoke=revoke, register=register)
+            occupations=occupations, revoke=revoke, register=register,
+            supported=supported)
     except SolverLimitExceeded:
         raise HTTPException(status_code=503,
                             detail="求解超出资源限制，请缩小规模后重试")
@@ -328,7 +440,8 @@ def _run_preview(conn, session, revoke, register):
             **exc.analysis)
     state_hash = state_fingerprint(
         current_version=current, frequencies=session["frequencies"],
-        groups=groups, interferences=interferences, occupations=occupations)
+        groups=groups, interferences=interferences, occupations=occupations,
+        supported=supported)
     return preview, state_hash, current, current_assignment, locks
 
 
@@ -372,6 +485,7 @@ def preview_occupation_adjustment(session_id: int,
         "session_id": session_id,
         "snapshot_token": token,
         "base_version": current,
+        "config_revision": session["config_revision"],
         "change": {"revoke": canonical_change(revoke, register)["revoke"],
                    "register": register},
         "resulting_occupations": [
@@ -418,14 +532,17 @@ def confirm_occupation_adjustment(session_id: int,
     revoke, register = _payload_change(payload)
     occupations = _load_occupations(conn, session_id)
     groups = _load_groups(conn, session_id)
+    supported = _supported_map(session, groups)
     interferences = _load_interferences(conn, session_id)
     current = _current_version(conn, session_id)
 
-    # 版本/配置/占用指纹与预演快照不一致 -> 409（过期快照一律先判冲突：
-    # 状态已变时旧变更里的撤销编号可能恰好已不存在，此时冲突才是正确语义）
+    # 版本/配置（含组能力）/占用指纹与预演快照不一致 -> 409（过期快照一律先判
+    # 冲突：状态已变时旧变更里的撤销编号可能恰好已不存在，此时冲突才是正确
+    # 语义）
     state_hash = state_fingerprint(
         current_version=current, frequencies=session["frequencies"],
-        groups=groups, interferences=interferences, occupations=occupations)
+        groups=groups, interferences=interferences, occupations=occupations,
+        supported=supported)
     if snap["ver"] != current or snap["state"] != state_hash:
         raise _adjustment_error(
             409, "snapshot_conflict",
@@ -460,7 +577,8 @@ def confirm_occupation_adjustment(session_id: int,
         preview = compute_preview(
             frequencies=session["frequencies"], groups=groups, edges=edges,
             current_assignment=current_assignment, locks=locks,
-            occupations=occupations, revoke=revoke, register=register)
+            occupations=occupations, revoke=revoke, register=register,
+            supported=supported)
     except SolverLimitExceeded:
         raise HTTPException(status_code=503,
                             detail="求解超出资源限制，请缩小规模后重试")
@@ -531,6 +649,7 @@ def confirm_occupation_adjustment(session_id: int,
         "applied": True,
         "base_version": current,
         "version": new_version,
+        "config_revision": session["config_revision"],
         "replacement_published": new_plan_id is not None,
         "changed_groups": [
             {"group_id": gid,
@@ -573,8 +692,10 @@ def publish_plan(session_id: int, payload: PlanCreate,
 
     须提交所见版本号 base_version：与当前最新发布版不一致时返回 409，
     并发发布只有一个可以成功。规划在同一场次行锁内读取当前占用，保证
-    基于一致占用状态；占用与干扰、锁定共同导致无解时返回 422 并说明
-    涉及的锁定组、干扰关系或相关占用记录，当前发布版不变。
+    基于一致占用状态；每个组只能在其当前支持频点（再扣除占用禁用频点）
+    内选频，锁定频点还须属于该组支持集合（否则 400）。占用、组能力与干扰、
+    锁定共同导致无解时返回 422 并说明涉及的锁定组、干扰关系或相关占用
+    记录，当前发布版不变。
     """
     # 锁定场次行，串行化并发发布
     session = _load_session(conn, session_id, for_update=True)
@@ -588,6 +709,7 @@ def publish_plan(session_id: int, payload: PlanCreate,
 
     groups = _load_groups(conn, session_id)
     group_by_id = {g["id"]: g for g in groups}
+    supported = _supported_map(session, groups)
     interferences = _load_interferences(conn, session_id)
     # 发布在同一场次行锁内读取当前占用，保证基于一致占用状态
     occupations = _load_occupations(conn, session_id)
@@ -597,7 +719,8 @@ def publish_plan(session_id: int, payload: PlanCreate,
     forbidden = build_forbidden(groups, occupations)
     group_intervals = {g["id"]: (g["start"], g["end"]) for g in groups}
 
-    # 校验锁定：引用未知组 / 锁定不可用频点 / 重复锁定均拒绝整次操作
+    # 校验锁定：引用未知组 / 锁定不可用频点 / 锁定不属该组支持频点 /
+    # 重复锁定均拒绝整次操作
     locks: dict[int, int] = {}
     for lock in payload.locks:
         if lock.group_id not in group_by_id:
@@ -606,6 +729,15 @@ def publish_plan(session_id: int, payload: PlanCreate,
             raise bad_request(
                 f"组 {lock.group_id} 锁定的频点 {lock.frequency} "
                 "不在场次可用频点集合中")
+        if lock.frequency not in supported[lock.group_id]:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "unsupported_lock_frequency",
+                        "message": f"组 {lock.group_id} 的可调谐范围不包含"
+                                   f"锁定频点 {lock.frequency}",
+                        "group_id": lock.group_id, "frequency": lock.frequency,
+                        "supported_frequencies":
+                            sorted(supported[lock.group_id])})
         if lock.group_id in locks:
             raise bad_request(f"组 {lock.group_id} 被重复锁定")
         locks[lock.group_id] = lock.frequency
@@ -630,7 +762,8 @@ def publish_plan(session_id: int, payload: PlanCreate,
     try:
         result = FrequencySolver(
             [g["id"] for g in groups], session["frequencies"], edges,
-            previous, forbidden=forbidden).solve(locks)
+            previous, forbidden=forbidden,
+            supported=supported).solve(locks)
     except SolverLimitExceeded:
         raise HTTPException(status_code=503,
                             detail="求解超出资源限制，请缩小规模后重试")
@@ -639,7 +772,7 @@ def publish_plan(session_id: int, payload: PlanCreate,
         analysis = analyze_unsat(
             [g["id"] for g in groups], session["frequencies"], edges, locks,
             previous, occupations=[_occ_public(o) for o in occupations],
-            group_intervals=group_intervals)
+            group_intervals=group_intervals, supported=supported)
         raise HTTPException(
             status_code=422,
             detail={"error": "unsatisfiable",
@@ -666,6 +799,7 @@ def publish_plan(session_id: int, payload: PlanCreate,
     return {
         "session_id": session_id,
         "version": current + 1,
+        "config_revision": session["config_revision"],
         "changes": changes,
         "assignments": [{"group_id": gid, "frequency": assignment[gid]}
                         for gid in sorted(assignment)],
@@ -717,6 +851,7 @@ def get_plan(session_id: int, version: int, conn=Depends(db.get_conn)):
     return {
         "session_id": session_id,
         "version": plan["version"],
+        "config_revision": _load_session(conn, session_id)["config_revision"],
         "changes": plan["changes"],
         "assignments": [{"group_id": gid, "frequency": assignments[gid]}
                         for gid in sorted(assignments)],
@@ -788,8 +923,8 @@ def _assignment_list(assignment: dict[int, int]):
 
 
 def _endpoint_occ_detail(bad: dict, group_by_id: dict, occupations: list[dict]):
-    """在端点违规（unavailable/interferences/occupations）基础上补全相关
-    占用记录：按组时段与占用时段相交且频点相同匹配。"""
+    """在端点违规（unavailable/unsupported/interferences/occupations）基础上
+    补全相关占用记录：按组时段与占用时段相交且频点相同匹配。"""
     related = []
     seen = set()
     for item in bad["occupations"]:
@@ -803,7 +938,9 @@ def _endpoint_occ_detail(bad: dict, group_by_id: dict, occupations: list[dict]):
                                  occ["start"], occ["end"]):
                 seen.add(occ["id"])
                 related.append(_occ_public(occ))
-    return {**bad, "related_occupations": related}
+    result = dict(bad)
+    result.setdefault("unsupported", [])
+    return {**result, "related_occupations": related}
 
 
 @app.post("/sessions/{session_id}/retune")
@@ -827,6 +964,7 @@ def plan_retune(session_id: int, payload: RetuneRequest,
         session = _load_session(conn, session_id)  # 不存在 -> 404
         groups = _load_groups(conn, session_id)
         group_ids = {g["id"] for g in groups}
+        supported = _supported_map(session, groups)
         interferences = _load_interferences(conn, session_id)
         # 与配置、发布版在同一个可重复读只读事务中读取，占用快照一致
         occupations = _load_occupations(conn, session_id)
@@ -906,11 +1044,13 @@ def plan_retune(session_id: int, payload: RetuneRequest,
 
         planner = RetunePlanner(
             sorted(group_ids), session["frequencies"], edges,
-            start, target, fixed, forbidden=forbidden)
+            start, target, fixed, forbidden=forbidden, supported=supported)
         start_bad, target_bad = planner.endpoint_violations()
-        if start_bad["unavailable"] or start_bad["interferences"] \
+        if start_bad["unavailable"] or start_bad.get("unsupported") \
+                or start_bad["interferences"] \
                 or start_bad["occupations"] \
-                or target_bad["unavailable"] or target_bad["interferences"] \
+                or target_bad["unavailable"] or target_bad.get("unsupported") \
+                or target_bad["interferences"] \
                 or target_bad["occupations"]:
             raise _retune_error(
                 422, "endpoint_infeasible",
@@ -1085,14 +1225,16 @@ def submit_measurement(session_id: int, payload: MeasurementCreate,
             "相同批次号已提交过不同内容；相同批次+相同内容的重试才会返回原结果",
             batch_no=payload.batch_no)
 
-    # 判定依据均在本场次行锁内读取：配置、发布版与当前占用为同一份一致快照
+    # 判定依据均在本场次行锁内读取：配置（含组能力）、发布版与当前占用为同一
+    # 份一致快照
     interferences = _load_interferences(conn, session_id)
     occupations = _load_occupations(conn, session_id)
+    supported = _supported_map(session, groups)
     readings = {item.group_id: item.frequency for item in payload.readings}
 
     result = analyze_measurement(
         groups, readings, session["frequencies"], plan_assignment,
-        interferences, occupations)
+        interferences, occupations, supported=supported)
     result["available_frequencies"] = session["frequencies"]
     occupation_snapshot = [
         {"id": occ["id"], "frequency": occ["frequency"],

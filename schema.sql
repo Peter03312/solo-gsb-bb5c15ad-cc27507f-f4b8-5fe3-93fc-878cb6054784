@@ -2,20 +2,32 @@
 -- 应用启动时自动执行（幂等），无需手工初始化。
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id           SERIAL PRIMARY KEY,
-    name         TEXT NOT NULL,
-    frequencies  INTEGER[] NOT NULL,          -- 场次可用的整数频点集合（升序、去重）
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              SERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    frequencies     INTEGER[] NOT NULL,          -- 场次可用的整数频点集合（升序、去重）
+    -- 组能力配置修订号：任一设备组的支持频点集合成功变更即自增；
+    -- 组能力按乐观锁（所见修订号）更新，过期提交拒绝（409）。
+    config_revision INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 既有库升级（幂等）
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS config_revision INTEGER NOT NULL DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS groups (
-    id           SERIAL PRIMARY KEY,          -- 组编号（自增，规划时按此升序）
-    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    name         TEXT NOT NULL DEFAULT '',
-    start_min    INTEGER NOT NULL,            -- 使用时段起点（分钟，左闭）
-    end_min      INTEGER NOT NULL,            -- 使用时段终点（分钟，右开）
+    id                      SERIAL PRIMARY KEY,  -- 组编号（自增，规划时按此升序）
+    session_id              INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    name                    TEXT NOT NULL DEFAULT '',
+    start_min               INTEGER NOT NULL,    -- 使用时段起点（分钟，左闭）
+    end_min                 INTEGER NOT NULL,    -- 使用时段终点（分钟，右开）
+    -- 该组可调谐的支持频点集合（场次可用频点的非空子集）；
+    -- NULL 表示录入时未填写或为既有组：视为支持场次全部频点。
+    supported_frequencies   INTEGER[],
     CHECK (start_min < end_min)
 );
+
+-- 既有库升级（幂等）：NULL 行即“支持全部频点”
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS supported_frequencies INTEGER[];
 
 CREATE TABLE IF NOT EXISTS interferences (
     id             SERIAL PRIMARY KEY,

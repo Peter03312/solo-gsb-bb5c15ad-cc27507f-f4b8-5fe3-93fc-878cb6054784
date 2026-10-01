@@ -125,6 +125,44 @@ class TestOccupations:
         assert assignment == {1: 4, 2: 1}
 
 
+class TestSupportedFrequencies:
+    def test_domain_limited_to_supported_set(self):
+        # 组 2 仅支持 {4,5,6}：间距 3 下字典序最小解为 (1, 4)（未收窄时一致）；
+        # 组 1 仅支持 {2,3} 时组 1 必须取 2，组 2 取 5
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            supported={1: {2, 3}, 2: {4, 5, 6}})
+        assignment, _ = solver.solve()
+        assert assignment == {1: 2, 2: 5}
+
+    def test_narrow_supported_set_unsatisfiable(self):
+        # 两组全程重叠、间距 3，但两组都只支持 {1,2,3}：无解
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            supported={1: {1, 2, 3}, 2: {1, 2, 3}})
+        assert solver.solve() is None
+
+    def test_lock_outside_supported_set_unsatisfiable(self):
+        solver = FrequencySolver(
+            [1], [1, 2, 3, 4], [], supported={1: {1, 2}})
+        assert solver.solve({1: 3}) is None
+
+    def test_default_supported_is_full_session(self):
+        solver = FrequencySolver([1, 2], [1, 2, 3, 4, 5], [(1, 2, 3)])
+        assert solver.supported == {1: {1, 2, 3, 4, 5},
+                                    2: {1, 2, 3, 4, 5}}
+
+    def test_capability_narrows_rechange_solution(self):
+        # 前版 (1,4)；组 2 当前不支持 5，占用 4 后只能改到 6（支持 {4,6}）
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            previous={1: 1, 2: 4}, forbidden={2: {4}},
+            supported={1: set(range(1, 7)), 2: {4, 6}})
+        assignment, changes = solver.solve()
+        assert assignment == {1: 1, 2: 6}
+        assert changes == 1
+
+
 class TestAnalyzeUnsatOccupations:
     def test_occupation_core(self):
         # 单组频点 {1,2}，两频点均在其时段被占用：核心含两条占用
@@ -217,3 +255,22 @@ class TestAnalyzeUnsat:
         result = analyze_unsat([1, 2, 3], [1, 2, 3, 4, 5], edges, locks)
         assert result["cause"] == "locks"
         assert {l["group_id"] for l in result["locks"]} == {1, 2}
+
+
+class TestAnalyzeUnsatSupported:
+    def test_capability_cause_without_locks(self):
+        # 两组间距 3 但能力都只覆盖 {1,2,3}：无锁定也无解，按干扰关系归因
+        result = analyze_unsat(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)], {},
+            supported={1: {1, 2, 3}, 2: {1, 2, 3}})
+        assert result["cause"] == "interferences"
+        assert result["interferences"] == [
+            {"group_a": 1, "group_b": 2, "min_separation": 3}]
+
+    def test_capability_lock_core(self):
+        # 组 1 锁定到其支持集合之外的频点（在场次集合内）：锁定核心
+        result = analyze_unsat(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)], {1: 4},
+            supported={1: {1, 2, 3}, 2: set(range(1, 7))})
+        assert result["cause"] == "locks"
+        assert result["locks"] == [{"group_id": 1, "frequency": 4}]

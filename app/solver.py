@@ -54,16 +54,19 @@ class FrequencySolver:
     """对单个场次的一次规划求解。
 
     :param group_ids:   参与规划的组编号。
-    :param frequencies: 可用整数频点集合。
+    :param frequencies: 可用整数频点集合（场次频点全集）。
     :param edges:       生效的干扰关系 [(group_a, group_b, min_separation)]，
                         调用方需已按“时段相交”过滤。
     :param previous:    前一发布版的分配 {group_id: frequency}，仅共有组参与
                         改频数统计；无前一版时传 None（改频数目标恒为 0）。
     :param forbidden:   每个组因外部设备占用而禁用的频点 {group_id: set}。
+    :param supported:   每个组的可调谐支持频点 {group_id: set}，须为场次频点
+                        子集；未列出的组视为支持场次全部频点。各组的可选域为
+                        “支持频点 − 占用禁用频点”。
     """
 
     def __init__(self, group_ids, frequencies, edges, previous=None,
-                 forbidden=None, max_nodes: int = 2_000_000):
+                 forbidden=None, supported=None, max_nodes: int = 2_000_000):
         self.groups = sorted(set(group_ids))
         self.frequencies = sorted(set(frequencies))
         self.previous = dict(previous or {})
@@ -71,6 +74,11 @@ class FrequencySolver:
         for gid, freqs in (forbidden or {}).items():
             if gid in self.forbidden:
                 self.forbidden[gid] = set(freqs)
+        # 组能力：缺省为场次全部频点
+        self.supported = {g: set(self.frequencies) for g in self.groups}
+        for gid, freqs in (supported or {}).items():
+            if gid in self.supported:
+                self.supported[gid] = set(freqs)
         self.adj = {g: [] for g in self.groups}
         for g1, g2, sep in edges:
             if g1 in self.adj and g2 in self.adj:
@@ -89,14 +97,16 @@ class FrequencySolver:
                 f"search exceeded {self.max_nodes} nodes")
 
     def _initial_domains(self, locks):
-        domains = {g: set(self.frequencies) - self.forbidden[g]
+        domains = {g: (set(self.supported[g]) - self.forbidden[g])
                    for g in self.groups}
         available = set(self.frequencies)
         for g, f in locks.items():
-            # 锁定不可用/被占用频点时域为空，搜索会立即判无解（API 层已先行
-            # 拒绝不可用频点；被占用频点在 422 无解分析中说明相关占用）
+            # 锁定不可用/不支持/被占用频点时域为空，搜索会立即判无解（API 层
+            # 已先行拒绝不可用/不支持频点；被占用频点在 422 无解分析中说明
+            # 相关占用）
             if g in domains:
-                domains[g] = {f} & available - self.forbidden[g]
+                domains[g] = {f} & available & self.supported[g] \
+                    - self.forbidden[g]
         return domains
 
     def _change_cost(self, group, value):
@@ -200,7 +210,7 @@ def _minimize_core(unsat, items):
 
 
 def analyze_unsat(group_ids, frequencies, edges, locks, previous=None,
-                  occupations=(), group_intervals=None):
+                  occupations=(), group_intervals=None, supported=None):
     """分析无解原因，返回结构化说明。
 
     - 若去掉锁定后仍无解：在“干扰关系 + 占用”并集上求不可约约束子集，
@@ -211,11 +221,14 @@ def analyze_unsat(group_ids, frequencies, edges, locks, previous=None,
                         ``end``）；与设备组时段相交的占用构成该组的禁用频点。
     :param group_intervals: {group_id: (start, end)}，用于判定占用与哪些组相交；
                         提供占用时必须给出。
+    :param supported:   每个组的支持频点 {group_id: set}；未列出的组视为支持
+                        场次全部频点（与 :class:`FrequencySolver` 一致）。
     """
     locks = dict(locks or {})
     occupations = list(occupations or [])
     groups = sorted(set(group_ids))
     intervals = group_intervals or {}
+    supported = supported or {}
 
     # 每条占用对哪些组禁用哪个频点
     occ_blocks: list[dict[int, int]] = []
@@ -236,10 +249,17 @@ def analyze_unsat(group_ids, frequencies, edges, locks, previous=None,
                 forbidden[gid].add(freq)
         return forbidden
 
+    def make_supported():
+        # 分析内部统一传全部组，缺省回退到场次全集
+        return {g: set(supported.get(g, frequencies)) for g in groups}
+
+    supported_sets = make_supported()
+
     def unsat_with(lock_list, edge_list, occ_indices=frozenset()):
         solver = FrequencySolver(
             groups, frequencies, edge_list, previous,
-            forbidden=make_forbidden(occ_indices))
+            forbidden=make_forbidden(occ_indices),
+            supported=supported_sets)
         return solver.solve(dict(lock_list)) is None
 
     if not unsat_with([], edges, range(len(occupations))):

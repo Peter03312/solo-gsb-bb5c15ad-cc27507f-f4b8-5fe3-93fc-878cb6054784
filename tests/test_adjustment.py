@@ -171,12 +171,69 @@ class TestPreview:
         assert pv["replacement"][2] == 5
 
 
+class TestSupportedFrequencies:
+    def test_capability_reported_as_unsupported_violation(self):
+        # 两组全程重叠、间距 3，场次频点 1..5；当前版 (1,4)。组 2 能力收窄到
+        # {1,2}、组 1 能力 {1,2,3}：当前版组2=4 记 unsupported；替代分配中
+        # 组2∈{1,2}、组1∈{1,2,3} 无法拉开间距 3 -> 无解（不允许确认）。
+        groups = [{"id": 1, "start": 0, "end": 100},
+                  {"id": 2, "start": 0, "end": 100}]
+        with pytest.raises(AdjustmentUnsat) as exc:
+            compute_preview(
+                frequencies=[1, 2, 3, 4, 5], groups=groups,
+                edges=[(1, 2, 3)],
+                current_assignment={1: 1, 2: 4}, locks={},
+                occupations=[], revoke=[], register=[],
+                supported={1: {1, 2, 3}, 2: {1, 2}})
+        # 无锁定、无占用：能力收窄经生效干扰关系体现，归因 interferences
+        assert exc.value.analysis["cause"] == "interferences"
+
+    def test_capability_unsupported_violation_detail_when_repairable(self):
+        # 可修复场景：组 2 能力 {1,2,3,5} 去掉其当前频点 4；明细给出 unsupported
+        # 且替代分配（组2->5）完全落在各组支持集合内。
+        pv = compute_preview(
+            frequencies=FREQS, groups=GROUPS, edges=EDGES,
+            current_assignment=CURRENT, locks={}, occupations=[],
+            revoke=[], register=[],
+            supported={1: set(FREQS), 2: {1, 2, 3, 5}, 3: set(FREQS)})
+        assert pv["violating_groups"] == [2]
+        assert pv["detail"]["unsupported"] == [
+            {"group_id": 2, "frequency": 4,
+             "supported_frequencies": [1, 2, 3, 5]}]
+        assert pv["replacement"] == {1: 1, 2: 5, 3: 1}
+
+    def test_capability_replacement_stays_in_set(self):
+        # 组 2 能力 {1,2,3,5}（去掉4）：组2 当前 4 不支持，最小改频改到 5
+        pv = compute_preview(
+            frequencies=FREQS, groups=GROUPS, edges=EDGES,
+            current_assignment=CURRENT, locks={}, occupations=[],
+            revoke=[], register=[],
+            supported={1: set(FREQS), 2: {1, 2, 3, 5}, 3: set(FREQS)})
+        assert pv["replacement"] == {1: 1, 2: 5, 3: 1}
+        assert pv["changed_groups"] == [2]
+
+    def test_capability_narrow_causes_unsat_when_lock_retained(self):
+        # 当前版锁组2=4，组2能力去掉4：锁定必须保留 -> 无解，cause=locks
+        with pytest.raises(AdjustmentUnsat) as exc:
+            compute_preview(
+                frequencies=[1, 2, 3, 4, 5],
+                groups=[{"id": 1, "start": 0, "end": 100},
+                        {"id": 2, "start": 0, "end": 100}],
+                edges=[(1, 2, 3)],
+                current_assignment={1: 1, 2: 4}, locks={2: 4},
+                occupations=[], revoke=[], register=[],
+                supported={1: {1, 2, 3, 4, 5}, 2: {1, 2, 3, 5}})
+        assert exc.value.analysis["cause"] == "locks"
+        assert exc.value.analysis["locks"] == [
+            {"group_id": 2, "frequency": 4}]
+
+
 class TestFingerprintsAndToken:
-    def _state(self, occupations=()):
+    def _state(self, occupations=(), supported=None):
         return dict(current_version=2, frequencies=FREQS, groups=GROUPS,
                     interferences=[{"id": 1, "group_a": 1, "group_b": 2,
                                     "min_separation": 3}],
-                    occupations=list(occupations))
+                    occupations=list(occupations), supported=supported)
 
     def test_state_fingerprint_changes_with_any_dimension(self):
         base = state_fingerprint(**self._state())
@@ -189,6 +246,18 @@ class TestFingerprintsAndToken:
         changed = self._state()
         changed["groups"] = GROUPS + [{"id": 4, "start": 0, "end": 9}]
         assert state_fingerprint(**changed) != base
+
+    def test_state_fingerprint_changes_with_group_capability(self):
+        # 组能力变化（即使占用/版本/组集合不变）必须使旧快照失效
+        base = state_fingerprint(**self._state())
+        narrowed = self._state(supported={
+            1: {1, 2, 3, 4, 5, 6}, 2: {1, 2, 3},
+            3: {1, 2, 3, 4, 5, 6}})
+        assert state_fingerprint(**narrowed) != base
+        # 显式给出全集与缺省（各组支持全部）等价
+        full = self._state(supported={
+            1: FREQS, 2: FREQS, 3: FREQS})
+        assert state_fingerprint(**full) == base
 
     def test_state_fingerprint_stable_for_same_state(self):
         occupations = [occ(2, 3, 0, 10), occ(1, 1, 5, 9)]

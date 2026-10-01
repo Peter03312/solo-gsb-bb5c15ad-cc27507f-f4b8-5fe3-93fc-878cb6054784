@@ -81,8 +81,26 @@ def lex_min_bruteforce(planner, start, target):
 class TestViolations:
     def test_clean_assignment(self):
         v = violations([1, 2], {1: 1, 2: 4}, [(1, 2, 3)], [1, 2, 3, 4, 5])
-        assert v == {"unavailable": [], "interferences": [],
-                     "occupations": []}
+        assert v == {"unavailable": [], "unsupported": [],
+                     "interferences": [], "occupations": []}
+
+    def test_supported_set_mismatch(self):
+        # 频点在场次可用集合内、但超出该组当前能力：记 unsupported
+        v = violations([1, 2], {1: 1, 2: 5}, [(1, 2, 3)],
+                       [1, 2, 3, 4, 5],
+                       supported={1: {1, 2, 3}, 2: {1, 2, 3, 4}})
+        assert v["unavailable"] == []
+        assert v["unsupported"] == [
+            {"group_id": 2, "frequency": 5,
+             "supported_frequencies": [1, 2, 3, 4]}]
+        assert v["interferences"] == []
+
+    def test_out_of_session_is_unavailable_not_unsupported(self):
+        # 不属场次频点：归类为 unavailable，不再报 unsupported
+        v = violations([1, 2], {1: 1, 2: 9}, [(1, 2, 3)], [1, 2, 3],
+                       supported={1: {1, 2, 3}, 2: {1, 2, 3}})
+        assert v["unavailable"] == [{"group_id": 2, "frequency": 9}]
+        assert v["unsupported"] == []
 
     def test_unavailable_frequency(self):
         v = violations([1, 2], {1: 1, 2: 9}, [(1, 2, 3)], [1, 2, 3])
@@ -215,6 +233,53 @@ class TestOccupations:
         # planner 自身（禁用 4）终点不可行
         _, target_bad = planner.endpoint_violations()
         assert target_bad["occupations"] == [{"group_id": 3, "frequency": 4}]
+
+
+class TestSupportedFrequencies:
+    """组能力：每个步骤（含起终点）只能使用该组支持的频点。"""
+
+    edges = [(1, 2, 3), (2, 3, 3)]
+    start = {1: 1, 2: 4, 3: 1}
+    target = {1: 4, 2: 1, 3: 4}
+
+    def test_endpoint_outside_supported_set(self):
+        # 组 3 的目标频点 4 不属其当前支持集合：终点不可行（unsupported）
+        planner = RetunePlanner(
+            [1, 2, 3], list(range(1, 10)), self.edges,
+            self.start, self.target,
+            supported={1: set(range(1, 10)), 2: set(range(1, 10)),
+                       3: {1, 2, 3}})
+        start_bad, target_bad = planner.endpoint_violations()
+        assert start_bad["unsupported"] == []
+        assert {(b["group_id"], b["frequency"])
+                for b in target_bad["unsupported"]} == {(3, 4)}
+
+    def test_temp_steps_remain_within_supported_set(self):
+        # 默认字典序最小路线首步把组 2 借到 7；若组 2 仅支持 {1,2,3,4,5,8,9}，
+        # 首步必须改借 8，且全程不使用 6/7
+        supported = {1: set(range(1, 10)),
+                     2: {1, 2, 3, 4, 5, 8, 9},
+                     3: set(range(1, 10))}
+        planner = RetunePlanner(
+            [1, 2, 3], list(range(1, 10)), self.edges,
+            self.start, self.target, supported=supported)
+        route = planner.plan()
+        assert route != NO_SAFE_ROUTE
+        state = dict(self.start)
+        for gid, freq in route:
+            assert freq in supported[gid]
+            state[gid] = freq
+        assert state == self.target
+        assert route[0] == (2, 8)
+
+    def test_supported_set_can_freeze_space(self):
+        # 交换 (1,4)<->(4,1) 频点 1..7 需要缓冲频点 7；两组能力都只到 4 时，
+        # 无人可暂存，无安全路线（两端点本身均可行）
+        planner = RetunePlanner(
+            [1, 2], list(range(1, 8)), [(1, 2, 3)],
+            {1: 1, 2: 4}, {1: 4, 2: 1},
+            supported={1: {1, 2, 3, 4}, 2: {1, 2, 3, 4}})
+        assert planner.plan() == NO_SAFE_ROUTE
 
 
 class TestFixedGroups:

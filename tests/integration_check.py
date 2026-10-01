@@ -1042,6 +1042,257 @@ def main() -> int:
         check("当前版组集合不一致被拒绝(422)", r.status_code == 422
               and r.json()["detail"]["error"] == "group_set_mismatch", r.text)
 
+        # ---------------------------------------------------------------- #
+        # 设备组能力（可调谐支持频点）与配置修订号
+        # ---------------------------------------------------------------- #
+        r = c.post("/sessions", json={"name": "能力演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6]})
+        check("能力场次创建", r.status_code == 201
+              and r.json()["config_revision"] == 0, r.text)
+        kid = r.json()["id"]
+
+        # 录入组：组 a 不填（视为全部），组 b 显式只支持 {4,5,6}，组 c 全部
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "a", "start": 0, "end": 120})
+        ka = r.json()["id"]
+        check("未填支持频点的组回显全集",
+              r.status_code == 201
+              and r.json()["supported_frequencies"] == [1, 2, 3, 4, 5, 6],
+              r.text)
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "b", "start": 60, "end": 180,
+                         "supported_frequencies": [4, 5, 6]})
+        kb = r.json()["id"]
+        check("显式收窄支持频点的组回显子集",
+              r.status_code == 201
+              and r.json()["supported_frequencies"] == [4, 5, 6], r.text)
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "c", "start": 120, "end": 240})
+        kc = r.json()["id"]
+        # 非子集（含场次外频点）与空集拒绝
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "坏能力", "start": 0, "end": 10,
+                         "supported_frequencies": [3, 99]})
+        check("录入组支持频点非场次子集被拒绝(400)",
+              r.status_code == 400
+              and r.json()["detail"]["error"]
+              == "invalid_supported_frequencies", r.text)
+        r = c.post(f"/sessions/{kid}/groups",
+                   json={"name": "空能力", "start": 0, "end": 10,
+                         "supported_frequencies": []})
+        check("录入组空支持频点被拒绝(400)",
+              r.status_code == 400
+              and r.json()["detail"]["error"]
+              == "invalid_supported_frequencies", r.text)
+        c.post(f"/sessions/{kid}/interferences",
+               json={"group_a": ka, "group_b": kb, "min_separation": 3})
+
+        # 读取组信息：支持集合 + 配置修订号（场次详情、单组读取一致）
+        r = c.get(f"/sessions/{kid}/groups/{kb}")
+        check("单组读取返回支持集合与修订号",
+              r.status_code == 200
+              and r.json()["supported_frequencies"] == [4, 5, 6]
+              and r.json()["config_revision"] == 0, r.text)
+        r = c.get(f"/sessions/{kid}")
+        gd = {g["id"]: g["supported_frequencies"]
+              for g in r.json()["groups"]}
+        check("场次详情含各组支持集合与修订号",
+              r.json()["config_revision"] == 0
+              and gd == {ka: [1, 2, 3, 4, 5, 6], kb: [4, 5, 6],
+                         kc: [1, 2, 3, 4, 5, 6]}, str(gd))
+
+        # 首次规划须遵守能力：a 与 b 间距 3；b∈{4,5,6}，字典序最小 -> (1,4)；
+        # c 与 b 时段相交（[60,180)∩[120,240)）间距 3 -> c=1
+        r = c.post(f"/sessions/{kid}/plans",
+                   json={"base_version": 0, "locks": []})
+        check("能力内首次规划", r.status_code == 201, r.text)
+        ka1 = {x["group_id"]: x["frequency"]
+               for x in r.json()["assignments"]}
+        check("规划遵守支持集合 (a,b,c)=(1,4,1)",
+              ka1 == {ka: 1, kb: 4, kc: 1}, str(ka1))
+
+        # 锁定不属该组能力的频点 -> 400（整次拒绝）
+        r = c.post(f"/sessions/{kid}/plans",
+                   json={"base_version": 1,
+                         "locks": [{"group_id": kb, "frequency": 3}]})
+        check("锁定频点不属组能力被拒绝(400)",
+              r.status_code == 400
+              and r.json()["detail"]["error"]
+              == "unsupported_lock_frequency"
+              and r.json()["detail"]["supported_frequencies"] == [4, 5, 6],
+              r.text)
+
+        # 按组变更能力：乐观锁。过期修订号拒绝且不覆盖
+        r = c.put(f"/sessions/{kid}/groups/{kb}/supported",
+                  json={"frequencies": [5, 6], "revision": 5})
+        check("过期修订号被拒绝(409)且不覆盖",
+              r.status_code == 409
+              and r.json()["detail"]["error"] == "stale_config_revision"
+              and r.json()["detail"]["current_revision"] == 0, r.text)
+        r = c.put(f"/sessions/{kid}/groups/{kb}/supported",
+                  json={"frequencies": [5, 6], "revision": 0})
+        check("携带所见修订号变更能力成功",
+              r.status_code == 200
+              and r.json()["supported_frequencies"] == [5, 6]
+              and r.json()["config_revision"] == 1, r.text)
+        # 非场次子集拒绝（修订号保持 1，不前进）
+        r = c.put(f"/sessions/{kid}/groups/{kb}/supported",
+                  json={"frequencies": [5, 7], "revision": 1})
+        check("能力变更非场次子集被拒绝(400)",
+              r.status_code == 400
+              and r.json()["detail"]["error"]
+              == "invalid_supported_frequencies", r.text)
+        r = c.get(f"/sessions/{kid}/groups/{kb}")
+        check("非法变更后修订号不前进",
+              r.json()["supported_frequencies"] == [5, 6]
+              and r.json()["config_revision"] == 1, r.text)
+        # 旧修订号再次提交：拒绝
+        r = c.put(f"/sessions/{kid}/groups/{kb}/supported",
+                  json={"frequencies": [4, 5, 6], "revision": 0})
+        check("用过的修订号再提交冲突(409)",
+              r.status_code == 409
+              and r.json()["detail"]["error"] == "stale_config_revision",
+              r.text)
+        r = c.put(f"/sessions/{kid}/groups/{999999}/supported",
+                  json={"frequencies": [1], "revision": 1})
+        check("变更未知组能力返回404", r.status_code == 404, r.text)
+
+        # 能力收窄不自动重写历史发布版：v1 原样可读
+        r = c.get(f"/sessions/{kid}/plans/1")
+        check("历史发布版保持原样（b 仍为4，尽管现已不支持）",
+              {a["group_id"]: a["frequency"]
+               for a in r.json()["assignments"]} == {ka: 1, kb: 4, kc: 1},
+              r.text)
+
+        # 旧版在当前能力下不可用：retune 报告涉及组（b 的端点频点 4 不支持）
+        r = c.post(f"/sessions/{kid}/retune",
+                   json={"start_version": 1, "target_version": 1,
+                         "fixed_groups": []})
+        check("旧版端点不属当前能力 -> 422 endpoint_infeasible",
+              r.status_code == 422
+              and r.json()["detail"]["error"] == "endpoint_infeasible",
+              r.text)
+        ends = r.json()["detail"]
+        unsup = {(b["group_id"], b["frequency"])
+                 for b in ends["start"]["unsupported"]}
+        check("422 指出不支持的组（b=4）及其能力",
+              unsup == {(kb, 4)}
+              and ends["start"]["unsupported"][0]["supported_frequencies"]
+              == [5, 6], str(ends))
+
+        # 重新规划（基于 v1）：现在 b∈{5,6}；保持 a=1（改频最小）需 b 与 a
+        # 间距>=3，b=5 合法；c=1 与 b=5 间距4 合法 -> (1,5,1)，仅 b 改频
+        r = c.post(f"/sessions/{kid}/plans",
+                   json={"base_version": 1, "locks": []})
+        check("能力收窄后重新规划成功", r.status_code == 201
+              and r.json()["config_revision"] == 1, r.text)
+        ka2 = {x["group_id"]: x["frequency"]
+               for x in r.json()["assignments"]}
+        check("新版 (a,b,c)=(1,5,1)，仅 b 改频",
+              ka2 == {ka: 1, kb: 5, kc: 1}
+              and r.json()["changes"] == 1, str(ka2))
+
+        # 能力变化使旧占用调整快照失效：先在当前状态预演（不产生违规，
+        # 当前版即 v2 与能力一致），再改能力，确认应 409
+        r = c.post(f"/sessions/{kid}/occupations/preview",
+                   json={"register": [
+                       {"frequency": 6, "start": 0, "end": 200}]})
+        check("能力一致时预演成功", r.status_code == 200, r.text)
+        ktoken = r.json()["snapshot_token"]
+        r = c.put(f"/sessions/{kid}/groups/{kb}/supported",
+                  json={"frequencies": [5], "revision": 1})
+        check("再收窄能力（b 只支持5）",
+              r.status_code == 200
+              and r.json()["config_revision"] == 2, r.text)
+        r = c.post(f"/sessions/{kid}/occupations/confirm",
+                   json={"snapshot_token": ktoken,
+                         "register": [{"frequency": 6, "start": 0,
+                                       "end": 200}]})
+        check("能力变化后旧快照确认冲突(409)",
+              r.status_code == 409
+              and r.json()["detail"]["error"] == "snapshot_conflict", r.text)
+        # 冲突不留任何变更
+        r = c.get(f"/sessions/{kid}/occupations")
+        check("冲突后占用未登记、版本仍为2",
+              r.json() == []
+              and [p["version"] for p in c.get(
+                  f"/sessions/{kid}/plans").json()] == [1, 2], r.text)
+
+        # 能力导致约束无解时：发布 422，占用与当前发布版保持不变。
+        # 先补一条 b-c 干扰（时段 [60,180)∩[120,240) 相交，间距 3）；
+        # 再把 b、c 能力都收窄到 {5,6}：二者在 {5,6} 内无法拉开间距 3，
+        # 无论 a 取何值都无解。
+        r = c.post(f"/sessions/{kid}/interferences",
+                   json={"group_a": kb, "group_b": kc, "min_separation": 3})
+        check("补录 b-c 干扰关系", r.status_code == 201, r.text)
+        r = c.put(f"/sessions/{kid}/groups/{kb}/supported",
+                  json={"frequencies": [5, 6], "revision": 2})
+        check("收窄 b 能力到 {5,6}（修订号->3）", r.status_code == 200
+              and r.json()["config_revision"] == 3, r.text)
+        r = c.put(f"/sessions/{kid}/groups/{kc}/supported",
+                  json={"frequencies": [5, 6], "revision": 3})
+        check("收窄 c 能力到 {5,6}（修订号->4）", r.status_code == 200
+              and r.json()["config_revision"] == 4, r.text)
+        r = c.post(f"/sessions/{kid}/plans",
+                   json={"base_version": 2, "locks": []})
+        check("能力导致无解 -> 422", r.status_code == 422
+              and r.json()["detail"]["error"] == "unsatisfiable", r.text)
+        detail = r.json()["detail"]
+        check("422 归因于生效干扰关系（能力收窄所致）",
+              detail["cause"] == "interferences"
+              and {(i["group_a"], i["group_b"])
+                   for i in detail["interferences"]} == {(kb, kc)},
+              str(detail))
+        r = c.get(f"/sessions/{kid}/plans")
+        check("无解后当前发布版仍为2",
+              [p["version"] for p in r.json()] == [1, 2], r.text)
+
+        # 恢复 c 能力后可正常发布（验证“无解除外，系统可继续工作”）
+        r = c.put(f"/sessions/{kid}/groups/{kc}/supported",
+                  json={"frequencies": [1, 2, 3, 4, 5, 6], "revision": 4})
+        check("恢复 c 能力（修订号->5）", r.status_code == 200
+              and r.json()["config_revision"] == 5, r.text)
+
+        # 逐组切换：同版 0 步在当前能力可行时返回空 steps
+        r = c.post(f"/sessions/{kid}/retune",
+                   json={"start_version": 2, "target_version": 2,
+                         "fixed_groups": []})
+        check("可行同版切换 0 步", r.status_code == 200
+              and r.json()["steps_count"] == 0, r.text)
+
+        # 实测批次：照实留存不支持的频点并标异常（不拒绝）。
+        # 当前能力：b={5,6}、c=全集、a=全集；依据 v2=(1,5,1)。
+        # 实测 b=4（场次可用但 b 不支持）、a=9（场次外，不可用）。
+        r = c.post(f"/sessions/{kid}/measurements",
+                   json={"plan_version": 2, "batch_no": 1, "readings": [
+                       {"group_id": ka, "frequency": 9},
+                       {"group_id": kb, "frequency": 4},
+                       {"group_id": kc, "frequency": 1}]})
+        check("实测含不支持/不可用频点仍留存(201)",
+              r.status_code == 201, r.text)
+        mbody = r.json()
+        check("实测标记 unsupported（b=4，当前支持{5,6}）",
+              mbody["unsupported_frequencies"] == [
+                  {"group_id": kb, "frequency": 4,
+                   "supported_frequencies": [5, 6]}], str(mbody))
+        check("实测标记 unavailable（a=9 场次外）",
+              mbody["unavailable_frequencies"] == [
+                  {"group_id": ka, "frequency": 9}], str(mbody))
+        check("实测 anomalies 含两类",
+              set(mbody["anomalies"]) == {
+                  "deviation", "unavailable_frequency",
+                  "unsupported_frequency"}, str(mbody["anomalies"]))
+
+        # 已固化批次不重算：之后再放宽 b 能力，历史批次仍固化旧核对结果
+        r = c.put(f"/sessions/{kid}/groups/{kb}/supported",
+                  json={"frequencies": [4, 5, 6], "revision": 5})
+        check("放宽 b 能力（修订号->6）", r.status_code == 200, r.text)
+        r = c.get(f"/sessions/{kid}/measurements/1")
+        check("已固化批次不随能力变化重算",
+              r.json()["unsupported_frequencies"] == [
+                  {"group_id": kb, "frequency": 4,
+                   "supported_frequencies": [5, 6]}], r.text)
+
         print()
         if _failures:
             print(f"{len(_failures)} 项失败: {_failures}")

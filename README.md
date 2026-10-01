@@ -6,7 +6,14 @@
 核对其与指定发布版及当前约束的差异，并将结果与占用快照固化。
 
 - 时段相交的干扰组，频点间距不小于其最小间距；同组全程只用一个频点；
-- 规划时可锁定部分组的频点；
+- **每个设备组有可调谐范围（支持频点集合）**：录入组时可选填，须是场次
+  可用频点的非空子集；未填写及既有组视为支持场次全部频点。规划/发布、
+  锁定、占用调整的预演与确认、逐组切换的端点与每个中间步骤都只能使用各组
+  当前支持的频点；
+- 支持集合按组以**配置修订号**做乐观锁变更：读取组信息返回支持集合与修订号，
+  变更须携带所见修订号；过期提交拒绝（409）且不覆盖新配置。能力收窄不自动
+  重写历史发布版；旧版在当前能力下不可用时由逐组切换等接口报告涉及组；
+- 规划时可锁定部分组的频点（锁定频点还须属于该组当前支持集合）；
 - 现场其他设备可在指定整数分钟时段占用场次频点：设备组时段与占用时段
   相交（左闭右开，端点相接不算）时，该组不得选用被占用频点；
 - 目标依次为：满足所有约束 → 最小化与前一发布版共有组的改频数（首次规划
@@ -74,13 +81,19 @@ python tests/integration_check.py
 
 ## 数据模型与约定
 
-- **场次（session）**：名称 + 可用整数频点集合；
+- **场次（session）**：名称 + 可用整数频点集合；另有从 0 起的**配置修订号
+  `config_revision`**，任一设备组的支持频点集合成功变更即自增；
 - **设备组（group）**：使用时段 `[start, end)`，左闭右开，整数分钟；`id`
-  即组编号（自增），规划的字典序比较按组编号升序；
+  即组编号（自增），规划的字典序比较按组编号升序；另含该组**支持频点集合
+  `supported_frequencies`**（该组可调谐范围，为场次频点的非空子集），未填写
+  时以 `NULL` 存储、对外回显为场次全部频点（既有组同理）；
 - **干扰关系（interference）**：两个组 + 正整数最小频点间距，仅当两组时段
   相交时生效；
 - **发布版（plan）**：场次内版本号从 1 递增，发布后不可变，记录分配结果、
-  改频数与本次锁定。
+  改频数与本次锁定。发布版不随组能力或占用变化而重写；
+- **组能力配置修订号（config_revision）**：场次级、从 0 起；仅“按组变更
+  支持频点集合”成功时自增，录入组、发布、占用变更均不改变它。读取组信息
+  （单组或场次详情）可获得当前值，按组变更支持集合时须回传所见值；
 - **占用记录（occupation）**：外部设备在整数分钟时段 `[start, end)`
   （左闭右开）占用场次某个可用频点；记录编号自增，撤销即删除。设备组时段
   与占用时段相交时该组禁用此频点，端点相接（如组 `[0,60)` 与占用
@@ -95,8 +108,10 @@ python tests/integration_check.py
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
 | POST | `/sessions` | 创建场次（登记可用频点集合） |
-| GET  | `/sessions/{id}` | 场次详情（含组与干扰关系） |
-| POST | `/sessions/{id}/groups` | 录入设备组及时段 |
+| GET  | `/sessions/{id}` | 场次详情（含配置修订号、组能力、干扰关系与占用） |
+| POST | `/sessions/{id}/groups` | 录入设备组及时段（可选填支持频点集合） |
+| GET  | `/sessions/{id}/groups/{gid}` | 读取设备组（返回支持集合与配置修订号） |
+| PUT  | `/sessions/{id}/groups/{gid}/supported` | 携带修订号变更组支持频点集合（乐观锁） |
 | POST | `/sessions/{id}/interferences` | 录入干扰关系 |
 | POST | `/sessions/{id}/occupations` | 登记频点占用（返回记录编号） |
 | GET  | `/sessions/{id}/occupations` | 查询场次当前占用 |
@@ -114,11 +129,13 @@ python tests/integration_check.py
 | GET  | `/sessions/{id}/measurements/{batch_no}` | 读取指定批次与固化核对结果 |
 
 状态码约定：`201` 创建/发布成功；`400` 校验失败（起点不早于终点、引用未知
-组、锁定不可用频点、占用频点不属于场次、撤销未知占用记录、占用调整的未知/
-重复撤销编号与非法登记、实测未知发布版/漏组/重复组等）；`404` 资源不存在；
-`409` 版本、批次或占用调整快照冲突；`422` 约束不可满足（当前发布版不变）。
+组、锁定不可用频点、**锁定频点不属该组当前支持集合**、支持频点非场次频点的
+非空子集、占用频点不属于场次、撤销未知占用记录、占用调整的未知/重复撤销编号
+与非法登记、实测未知发布版/漏组/重复组等）；`404` 资源不存在；
+`409` 版本、**配置修订号**、批次或占用调整快照冲突；`422` 约束不可满足
+（当前发布版不变）。
 实测批次同批次同内容重试返回 `200`（幂等）；占用调整预演与确认成功均为
-`200`（预演只读、确认可能顺带发布新版）。
+`200`（预演只读、确认可能顺带发布新版）；变更组支持集合成功为 `200`。
 
 ## 请求示例
 
@@ -181,6 +198,121 @@ curl -s http://localhost:8000/sessions/1/plans/2/diff
     "current_version": 2
   }
 }
+```
+
+## 设备组可调谐能力（支持频点）与配置修订号
+
+现场设备的可调谐范围可能**小于**场次频点集合。每个设备组带一个支持频点集合
+`supported_frequencies`，表示该组实际能调到的频点：
+
+- **录入设备组时可选填**（`POST /sessions/{id}/groups` 的
+  `supported_frequencies` 字段）；必须是场次可用频点的**非空子集**，否则
+  `400 invalid_supported_frequencies`；**未填写（缺省/null）及既有组视为
+  支持场次全部频点**，对外读取时回显为场次全部频点；
+- **读取组信息返回支持集合与配置修订号**：
+  - `GET /sessions/{id}/groups/{gid}` 返回该组 `supported_frequencies`
+    （生效集合）与场次当前 `config_revision`；
+  - `GET /sessions/{id}` 的每个组对象也带 `supported_frequencies`，场次对象
+    带 `config_revision`；
+- **按组变更支持集合（乐观锁）**：
+  `PUT /sessions/{id}/groups/{gid}/supported`，请求体
+  `{"frequencies": [...], "revision": <所见修订号>}`：
+  - 新集合必须是场次可用频点的**非空子集**，否则 `400`；
+  - `revision` 必须等于当前配置修订号，否则 `409 stale_config_revision`，
+    **过期提交被拒绝且不覆盖新配置**（响应给出 `seen_revision` 与
+    `current_revision`）；组不存在返回 `404`；
+  - 成功后修订号自增 1（录入新组**不**改变修订号），返回新支持集合与新
+    修订号；
+  - 与发布、占用登记/撤销、占用调整确认**共用场次行锁串行**。
+
+**能力如何影响其他环节：**
+
+- **规划与发布（含锁定）**：求解器对每个组只在“支持频点 − 占用禁用频点”
+  的域内选频；锁定频点除须属于场次频点外，还必须属于该组当前支持集合，否则
+  `400 unsupported_lock_frequency`。能力收窄导致约束无解时发布返回 `422`，
+  **占用与当前发布版保持不变**；
+- **历史发布版保持原样**：能力变化**不**重写、**不**删除任何既有发布版；
+- **旧版在当前能力下不可用时报告涉及组**：`POST /retune` 的端点检查新增
+  `unsupported` 一类——频点仍在场次可用集合内、但不属于某组当前支持集合时，
+  返回 `422 endpoint_infeasible`，在 `start`/`target` 的 `unsupported` 中给出
+  组、频点与该组当前 `supported_frequencies`；逐组切换的**每个中间步骤**同样
+  只能使用各组支持频点（临时频点也受限），能力收窄可能使原可行路线变为
+  `no_safe_route`；
+- **占用调整（预演/确认）**：当前发布版频点落到某组支持集合之外时，预演在
+  `violations.unsupported` 与 `violating_groups` 中报出，并给出只在各组能力
+  内选频的替代分配；能力内仍无解时 `422 unsatisfiable`（无快照令牌，不允许
+  确认）。快照指纹覆盖各组支持集合，**组能力变化即让此前的占用调整快照
+  失效**——用旧令牌确认返回 `409 snapshot_conflict`，不落任何变更；
+- **现场实测批次**：实测频点即使**不在该组当前支持集合内**也照实留存，在
+  `unsupported_frequencies` 中标记（频点不在场次集合时仍记
+  `unavailable_frequencies`），`anomalies` 含 `"unsupported_frequency"`；
+  核对结果随批次固化，**已固化批次不随后续能力变化重算**。
+
+```bash
+# 录入组时可选填支持频点（b 组只能调 4/5/6）
+curl -s -X POST http://localhost:8000/sessions/1/groups \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "灯光", "start": 60, "end": 180,
+       "supported_frequencies": [4, 5, 6]}'
+# => {"id":2,...,"supported_frequencies":[4,5,6]}
+
+# 读取组信息：支持集合 + 当前配置修订号
+curl -s http://localhost:8000/sessions/1/groups/2
+# => {"id":2,...,"supported_frequencies":[4,5,6],"config_revision":0}
+
+# 携带所见修订号收窄能力到 {5,6}
+curl -s -X PUT http://localhost:8000/sessions/1/groups/2/supported \
+  -H 'Content-Type: application/json' \
+  -d '{"frequencies": [5, 6], "revision": 0}'
+# => {"id":2,...,"supported_frequencies":[5,6],"config_revision":1,
+#     "previous_revision":0}
+
+# 过期修订号 -> 409，不覆盖
+curl -s -X PUT http://localhost:8000/sessions/1/groups/2/supported \
+  -H 'Content-Type: application/json' \
+  -d '{"frequencies": [5], "revision": 0}'
+# => {"detail":{"error":"stale_config_revision",...,
+#               "seen_revision":0,"current_revision":1}}
+```
+
+配置修订号冲突响应示例（409）：
+
+```json
+{
+  "detail": {
+    "error": "stale_config_revision",
+    "message": "所见配置修订号已过期，请重新读取组信息后提交",
+    "seen_revision": 0,
+    "current_revision": 1
+  }
+}
+```
+
+旧发布版端点超出当前组能力时的响应示例（`POST /retune`，422）：
+
+```json
+{
+  "detail": {
+    "error": "endpoint_infeasible",
+    "message": "起始版或目标版在当前规则（含频点占用）下不是可行分配",
+    "start": {
+      "unavailable": [],
+      "unsupported": [
+        {"group_id": 2, "frequency": 4, "supported_frequencies": [5, 6]}
+      ],
+      "interferences": [],
+      "occupations": [],
+      "related_occupations": []
+    },
+    "target": { "...": "同上" }
+  }
+}
+```
+
+也可以直接运行示例脚本（需服务已启动）：
+
+```bash
+bash examples/capabilities.sh     # 设备组能力、修订号与各环节行为
 ```
 
 ## 频点占用（现场其他设备）
@@ -283,7 +415,8 @@ bash examples/occupations.sh
 任何数据变化）：
 
 - 返回**快照标识** `snapshot_token`，覆盖当时的**当前发布版号、可用频点、
-  设备组时段、干扰关系与全部当前占用**（其中任何一项变化都会使确认冲突）；
+  设备组时段、各组支持频点（能力）、干扰关系与全部当前占用**（其中任何一项
+  变化都会使确认冲突）；
 - 返回当前发布版在**变更后**违反约束的组 `violating_groups` 及明细
   `violations`（不可用频点 / 违反的干扰关系 / 与占用冲突的组及相关占用）；
 - 返回**替代分配** `replacement_assignment` 与改频组 `changed_groups`。
@@ -395,11 +528,16 @@ bash examples/adjustment.sh
 的起始发布版、目标发布版，以及切换期间不可调频的组（可选），
 `POST /sessions/{id}/retune` 返回一条逐组切换路线：
 
-- 每一步只把**一个**组改到本场次的可用频点，可借用**临时频点**（某步的新
-  频点不是该组在目标版中的频点时，响应中 `temporary` 为 `true`）；
+- 每一步只把**一个**组改到该组**当前支持**的本场次频点，可借用**临时频点**
+  （某步的新频点不是该组在目标版中的频点时，响应中 `temporary` 为 `true`）；
+  临时频点同样必须属于该组当前支持集合；
 - 每一步之后（含起点、终点）的**完整分配**都必须满足当前按左闭右开时段
   生效的干扰关系及最小频点间距；外部设备**占用**的频点同样在起点、终点
   及每个临时步骤中禁用（占用取同一只读事务内的一致快照）；
+- 历史发布版中某组频点虽仍在场次频点内、但**已不在该组当前支持集合**时，
+  对应端点以 `unsupported` 报为不可行（`422 endpoint_infeasible`，给出涉及
+  组、频点与当前支持集合）；能力收窄也可能让原本可达的路线变成
+  `no_safe_route`；
 - 不可调频组在两版中的频点必须相同，且在整个路线中保持不变；
 - 优化目标依次为：**最少步骤数** → 按各步 `(组编号, 新频点)` 序列取
   **字典序最小**；
@@ -477,18 +615,19 @@ curl -s -X POST http://localhost:8000/sessions/1/retune \
 
 | 情形 | 状态码 | `detail.error` |
 | ---- | ------ | -------------- |
-| 起始版/目标版不存在、不可调频组引用未知组或重复指定 | 400 | `invalid_reference` |
+| 起始版或目标版不存在、不可调频组引用未知组或重复指定 | 400 | `invalid_reference` |
 | 场次不存在 | 404 | （`"场次不存在"`） |
 | 两版组集合不同，或与场次当前组集合不一致 | 422 | `group_set_mismatch` |
 | 不可调频组在两版中的频点不同（需改频） | 422 | `fixed_group_conflict` |
-| 起始版或目标版在当前规则下不是可行分配（含频点不可用、违反间距、组频点在当前占用中被禁用） | 422 | `endpoint_infeasible` |
+| 起始版或目标版在当前规则下不是可行分配（含频点不可用、**组当前不支持该频点**、违反间距、组频点在当前占用中被禁用） | 422 | `endpoint_infeasible` |
 | 两端点均可行，但不存在满足约束的逐组切换路线（配置空间被冻结） | 422 | `no_safe_route` |
 | 搜索规模超过资源上限 | 503 | （`"切换路线搜索超出资源限制…"`） |
 
 `endpoint_infeasible` 会分别给出起点/终点的不可用频点
-（`unavailable`）、违反的干扰关系（`interferences`）、与当前占用冲突的
-组及频点（`occupations`），并在 `related_occupations` 中给出对应占用记录
-的编号与时段；`group_set_mismatch` 会给出仅在某一版出现、以及当前配置中
+（`unavailable`）、**超出组当前能力的频点（`unsupported`，附该组当前
+`supported_frequencies`）**、违反的干扰关系（`interferences`）、与当前占用
+冲突的组及频点（`occupations`），并在 `related_occupations` 中给出对应占用
+记录的编号与时段；`group_set_mismatch` 会给出仅在某一版出现、以及当前配置中
 缺失/未知的组。
 例如端点可行却无安全路线时（422）：
 
@@ -505,6 +644,7 @@ curl -s -X POST http://localhost:8000/sessions/1/retune \
 
 ```bash
 bash examples/demo.sh          # 场次/组/干扰/发布/差异
+bash examples/capabilities.sh  # 设备组能力（支持频点）、配置修订号与各环节行为
 bash examples/occupations.sh   # 占用登记、查询、422 与撤销
 bash examples/adjustment.sh    # 现场占用调整：预演 + 快照冲突 + 原子确认
 bash examples/retune.sh        # 逐组切换路线（只读）
@@ -522,15 +662,20 @@ bash examples/measurements.sh  # 现场实测批次留存与核对
   操作（`detail.error` 分别为 `invalid_reference`、`group_set_mismatch`、
   `duplicate_group`）；场次不存在返回 `404`；
 - **频点照单全收**：实测频点即使不在场次可用集合内也如实留存，并在
-  `unavailable_frequencies` 中标明，不影响其余核对；
-- **核对结果**（四类，按组号/组号对排序）：
+  `unavailable_frequencies` 中标明；频点在场次集合内、但**不在该组当前支持
+  集合**（设备能力收窄）时，在 `unsupported_frequencies` 中标明（附该组当前
+  `supported_frequencies`）；两者都不影响其余核对；
+- **核对结果**（五类，按组号/组号对排序）：
   - `deviations`：实测频点偏离指定发布版的组（含发布版频点与实测频点）；
   - `unavailable_frequencies`：实测频点不在场次可用集合内的组；
+  - `unsupported_frequencies`：实测频点在场次集合内、但不属该组当前支持
+    集合的组；
   - `interference_violations`：时段相交（左闭右开、端点相接不算）时实测
     间距小于最小间距的干扰关系（含双方频点与实际间距）；
   - `occupation_conflicts`：实测频点与外部占用冲突的组，以及**全部**冲突
     占用的编号 `occupation_ids`（组时段与占用时段相交且频点相同）；
-  - `anomalies`：本次出现的异常类别列表，空列表表示全部正常；
+  - `anomalies`：本次出现的异常类别列表（含
+    `"unsupported_frequency"`），空列表表示全部正常；
 - **批次号与并发**：`batch_no` 低于已记录最新批次返回 `409 stale_batch`
   （允许跳号，只要求不回退）；相同批次号 + 相同内容的重试返回原结果，状态
   码为 `200`（首次提交为 `201`）且记录 `id` 不变；相同批次号 + 不同内容
@@ -624,11 +769,13 @@ curl -s http://localhost:8000/sessions/1/measurements/1
 app/main.py    HTTP API 与发布事务（行锁串行化并发发布与占用变更；现场占用
                调整预演为只读快照、确认在单事务内原子完成；切换路线只读
                快照，起点/终点/每个临时步骤都按当前占用检查）
-app/solver.py  回溯 + 前向检查求解器（含占用禁用频点）；无解时给出不可约的
-               锁定/干扰/占用核心
-app/adjustment.py 现场占用调整的纯逻辑：变更校验、状态/变更指纹与无状态
-               快照令牌、变更后违规检查与保留锁定的最少改频替代分配
-app/retune.py  逐组切换路线：连通分量分解 + 限深 BFS（最少步数、字典序最小）
+app/solver.py  回溯 + 前向检查求解器（含占用禁用频点与各组支持频点域）；无解时
+               给出不可约的锁定/干扰/占用核心
+app/adjustment.py 现场占用调整的纯逻辑：变更校验、状态/变更指纹（指纹含各组
+               支持频点，能力变化即使旧快照失效）与无状态快照令牌、变更后
+               违规检查（含 unsupported）与保留锁定的最少改频替代分配
+app/retune.py  逐组切换路线：连通分量分解 + 限深 BFS（最少步数、字典序最小；
+               端点与每个临时步骤都受占用与组支持集合约束）
 app/measurement.py  实测批次核对（偏离发布版/不可用频点/间距违规/占用冲突）
 app/db.py      连接池、启动重试与 schema 初始化
 schema.sql     表结构（应用启动时幂等执行；占用/实测/调整复用既有表）
